@@ -18,6 +18,9 @@ import {surfacePreviewCounts} from './surface-preview.js';
 import {validateAlignmentPinSpec} from './alignment-pin.js';
 import {validateDovetailSpec,assertDovetailVolumeChange} from './dovetail-connector.js';
 import {dovetailGeometry,cylindricalGeometry} from './connector-geometry.js';
+import {aplicarEncastreExacto,prismaSuelto,colaDeMilano} from './encastre-exacto.js';
+import {encastresEnCorte,diagnostico as diagEncastre} from './nucleo-encastres.js?v=20261107a';
+import {dovetailOutline} from './dovetail-connector.js';
 import {assertRectangularVolumeChange} from './rectangular-connector.js';
 import {recoverBedLayout,assertBedLayoutRoundTrip} from './bed-project-roundtrip.js';
 import {bedViewTransition,captureBedPlacementState} from './bed-view-switch.js';
@@ -58,7 +61,7 @@ let csgPromise=null;
 async function loadCSG(){
   const button=$('pegApplyBtn');button.disabled=true;
   try{
-    if(!csgPromise)csgPromise=import('https://cdn.jsdelivr.net/npm/three-bvh-csg@0.0.17/+esm').catch(error=>{csgPromise=null;throw error});
+    if(!csgPromise)csgPromise=import('three-bvh-csg').catch(()=>import('https://cdn.jsdelivr.net/npm/three-bvh-csg@0.0.17/+esm')).catch(error=>{csgPromise=null;throw error});
     const module=await csgPromise;
     if(!module.Brush||!module.Evaluator||module.ADDITION===undefined||module.SUBTRACTION===undefined)throw Error('Módulo CSG incompleto.');
     return module;
@@ -72,9 +75,31 @@ scene.add(new THREE.HemisphereLight(0xffffff,0x526c94,2.3));const key=new THREE.
 const grid=new THREE.GridHelper(400,24,0x2384b4,0x284963);scene.add(grid);
 const orbit=new OrbitControls(camera,renderer.domElement);orbit.enableDamping=true;orbit.dampingFactor=.08;
 const transform=new TransformControls(camera,renderer.domElement);transform.addEventListener('dragging-changed',e=>orbit.enabled=!e.value);scene.add(transform.getHelper());
+// El manipulador se coloca en el centro de la pieza (centro de su caja), no en su origen:
+// se mueve un pivote invisible y la pieza sigue la misma transformación.
+const gizmoPivot=new THREE.Object3D();gizmoPivot.name='Pivote del manipulador';scene.add(gizmoPivot);
+let gizmoTarget=null;const gizmoStart={pivot:new THREE.Matrix4(),target:new THREE.Matrix4()};
+function syncGizmoPivot(){
+  if(!gizmoTarget)return;
+  gizmoTarget.updateWorldMatrix(true,false);
+  const box=new THREE.Box3().setFromObject(gizmoTarget),c=box.isEmpty()?gizmoTarget.getWorldPosition(new THREE.Vector3()):box.getCenter(new THREE.Vector3());
+  gizmoPivot.position.copy(c);gizmoTarget.getWorldQuaternion(gizmoPivot.quaternion);gizmoPivot.scale.set(1,1,1);gizmoPivot.updateMatrixWorld(true);
+  gizmoStart.pivot.copy(gizmoPivot.matrixWorld);gizmoStart.target.copy(gizmoTarget.matrixWorld);
+}
+function attachGizmo(obj){gizmoTarget=obj;syncGizmoPivot();transform.attach(gizmoPivot);}
+transform.addEventListener('mouseDown',()=>syncGizmoPivot());
+transform.addEventListener('objectChange',()=>{
+  if(!gizmoTarget||transform.object!==gizmoPivot)return;
+  gizmoPivot.updateMatrixWorld(true);
+  // nueva matriz de la pieza = (pivote actual · pivote inicial⁻¹) · pieza inicial
+  const delta=gizmoPivot.matrixWorld.clone().multiply(gizmoStart.pivot.clone().invert()),world=delta.multiply(gizmoStart.target);
+  const parentInv=gizmoTarget.parent.matrixWorld.clone().invert(),local=parentInv.multiply(world);
+  local.decompose(gizmoTarget.position,gizmoTarget.quaternion,gizmoTarget.scale);gizmoTarget.updateMatrixWorld(true);
+});
+transform.addEventListener('mouseUp',()=>syncGizmoPivot());
 // Guía de corte transparente. No cambia la geometría ni ejecuta el corte.
 const cutGuide=new THREE.Group();scene.add(cutGuide);
-const guideSurface=new THREE.Mesh(new THREE.PlaneGeometry(1,1),new THREE.MeshBasicMaterial({color:0x35d8ff,transparent:true,opacity:.22,side:THREE.DoubleSide,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-1}));
+const guideSurface=new THREE.Mesh(new THREE.PlaneGeometry(1,1),new THREE.MeshBasicMaterial({color:0x35d8ff,transparent:true,opacity:.4,side:THREE.DoubleSide,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-1}));
 const guideBorder=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(1,1)),new THREE.LineBasicMaterial({color:0x8ef2ff,transparent:true,opacity:.98,depthTest:false}));
 cutGuide.add(guideSurface,guideBorder);cutGuide.visible=false;
 let showCutGuide=false,cutPair=null,touchPlaneActive=false,planeDrag=null;
@@ -505,7 +530,7 @@ function separateClosedSurface(){if(surfacePreview)clearSurfacePreview();
     status('Verificación superada '+details+'. Piezas previstas: '+triangles.map(n=>Math.round(n)).join(' y ')+' triángulos. Puedes confirmar la separación; comprueba los STL finales en el laminador.');
     return;
   }
-  save();transform.detach();clearSurfaceOverlays();
+  save();(transform.detach(),gizmoTarget=null);clearSurfaceOverlays();
   const make=(geometry,suffix)=>{
     const part=new THREE.Mesh(geometry,source.material);
     part.name=source.name+' — '+suffix;
@@ -535,7 +560,7 @@ $('separateSurfaceSelection').onclick=()=>separateClosedSurface();
 // Barrera de seguridad: ninguna operación experimental sustituye una malla
 // si la topología de sus resultados es abierta, degenerada o no verificable.
 function requireClosedResult(geometry,label){
-  const r=analyzeMeshGeometry(geometry,{tolerance:1e-6,maxTriangles:250000});
+  const r=analyzeMeshGeometry(geometry,{tolerance:1e-6,maxTriangles:4000000});
   if(!r.ok)throw new Error(`${label}: resultado no seguro (${r.reason||r.level}; bordes ${r.boundary??'?'}, no manifold ${r.nonManifold??'?'}, degenerados ${r.degenerate??'?'}). Se conserva el original.`);
   return r;
 }
@@ -543,12 +568,13 @@ function status(t){$('status').textContent=t}
 function snapshot(){return {items:meshes.map(m=>({m,g:m.geometry,parent:m.parent,p:m.position.toArray(),r:m.rotation.toArray().slice(0,3),s:m.scale.toArray(),visible:m.visible})),beds:beds.map(b=>({...b,items:[...b.items],placements:structuredClone(b.placements)})),nextBedId,activeBed,selected:selected?.uuid||null,surfaces:[...surfaceSelections.entries()].map(([id,set])=>[id,[...set]]),surfaceTouches:[...lastSurfaceTouch.entries()],rootPosition:root.position.toArray(),rootScale:root.scale.toArray(),rootQuaternion:root.quaternion.toArray(),explode,xray,explodeOrigins:[...explodeOrigins.entries()].map(([id,v])=>[id,v.toArray()])}}
 function save(){undo.push(snapshot());if(undo.length>50)undo.shift();redo=[];dirty=true}
 function applyVisualState(){meshes.forEach(m=>{const mats=Array.isArray(m.material)?m.material:[m.material];mats.forEach(mat=>{if(!mat)return;mat.transparent=xray;mat.opacity=xray?.35:1;mat.depthWrite=!xray;mat.needsUpdate=true})});$('xrayBtn').classList.toggle('active',xray);$('explodeBtn').classList.toggle('active',explode)}
-function restore(s){clearSurfaceOverlays();disablePegTouch();pegCustomOffsets=null;clearPegMarkers();touchPlaneActive=false;syncPlaneTouchUI();setGuide(false);cutPair=null;syncResultButtons();transform.detach();const desired=new Set(s.items.map(v=>v.m));for(const m of meshes)if(!desired.has(m))m.removeFromParent();meshes=s.items.map(v=>v.m);for(const v of s.items){if(v.m.parent!==v.parent)v.parent.add(v.m);v.m.geometry=v.g;v.m.position.fromArray(v.p);v.m.rotation.set(...v.r);v.m.scale.fromArray(v.s);v.m.visible=v.visible!==false}root.position.fromArray(s.rootPosition||[0,0,0]);root.scale.fromArray(s.rootScale||[1,1,1]);root.quaternion.fromArray(s.rootQuaternion||[0,0,0,1]);explode=!!s.explode;xray=!!s.xray;explodeOrigins=new Map((s.explodeOrigins||[]).map(([id,v])=>[id,new THREE.Vector3().fromArray(v)]));beds=s.beds.map(b=>({...b,items:[...b.items],placements:structuredClone(b.placements)}));nextBedId=s.nextBedId||Math.max(...beds.map(b=>b.id),0)+1;activeBed=beds.some(b=>b.id===s.activeBed)?s.activeBed:beds[0].id;selected=meshes.find(m=>m.uuid===s.selected)||null;modelLoaded=meshes.length>0;for(const [id,faces] of (s.surfaces||[])){const mesh=meshes.find(m=>m.uuid===id);if(mesh){surfaceSelections.set(id,new Set(faces));updateSurfaceOverlay(mesh)}}for(const [id,face] of (s.surfaceTouches||[]))if(surfaceSelections.get(id)?.has(face))lastSurfaceTouch.set(id,face);applyVisualState();refreshBeds();updateList();updateStats();if(bedMode)updateBedStage();if(selected&&tool==='Mover'&&!bedMode&&!explode)transform.attach(selected);syncResultButtons()}
+function restore(s){clearSurfaceOverlays();disablePegTouch();pegCustomOffsets=null;pegAutoInfo=null;clearPegMarkers();touchPlaneActive=false;syncPlaneTouchUI();setGuide(false);cutPair=null;syncResultButtons();(transform.detach(),gizmoTarget=null);const desired=new Set(s.items.map(v=>v.m));for(const m of meshes)if(!desired.has(m))m.removeFromParent();meshes=s.items.map(v=>v.m);for(const v of s.items){if(v.m.parent!==v.parent)v.parent.add(v.m);v.m.geometry=v.g;v.m.position.fromArray(v.p);v.m.rotation.set(...v.r);v.m.scale.fromArray(v.s);v.m.visible=v.visible!==false}root.position.fromArray(s.rootPosition||[0,0,0]);root.scale.fromArray(s.rootScale||[1,1,1]);root.quaternion.fromArray(s.rootQuaternion||[0,0,0,1]);explode=!!s.explode;xray=!!s.xray;explodeOrigins=new Map((s.explodeOrigins||[]).map(([id,v])=>[id,new THREE.Vector3().fromArray(v)]));beds=s.beds.map(b=>({...b,items:[...b.items],placements:structuredClone(b.placements)}));nextBedId=s.nextBedId||Math.max(...beds.map(b=>b.id),0)+1;activeBed=beds.some(b=>b.id===s.activeBed)?s.activeBed:beds[0].id;selected=meshes.find(m=>m.uuid===s.selected)||null;modelLoaded=meshes.length>0;for(const [id,faces] of (s.surfaces||[])){const mesh=meshes.find(m=>m.uuid===id);if(mesh){surfaceSelections.set(id,new Set(faces));updateSurfaceOverlay(mesh)}}for(const [id,face] of (s.surfaceTouches||[]))if(surfaceSelections.get(id)?.has(face))lastSurfaceTouch.set(id,face);applyVisualState();refreshBeds();updateList();updateStats();if(bedMode)updateBedStage();if(selected&&tool==='Mover'&&!bedMode&&!explode)attachGizmo(selected);syncResultButtons()}
 function undoStep(){if(!undo.length)return;redo.push(snapshot());restore(undo.pop());status('Acción deshecha.')}
 function redoStep(){if(!redo.length)return;undo.push(snapshot());restore(redo.pop());status('Acción rehecha.')}
-function clear(){if($('importDiagnosis'))$('importDiagnosis').textContent='Carga un modelo para comprobar sus mallas.';clearSurfaceOverlays();disablePegTouch();pegCustomOffsets=null;clearPegMarkers();touchPlaneActive=false;syncPlaneTouchUI();setGuide(false);cutPair=null;syncResultButtons();leaveBed();transform.detach();root.clear();root.position.set(0,0,0);root.rotation.set(0,0,0);root.scale.set(1,1,1);meshes=[];selected=null;undo=[];redo=[];basePositions.clear();explodeOrigins.clear();originalMaterials.clear();modelLoaded=false;dirty=false;explode=false;xray=false;applyVisualState();updateList();updateStats();resetBeds()}
+function clear(){if($('importDiagnosis'))$('importDiagnosis').textContent='Carga un modelo para comprobar sus mallas.';clearSurfaceOverlays();disablePegTouch();pegCustomOffsets=null;pegAutoInfo=null;clearPegMarkers();touchPlaneActive=false;syncPlaneTouchUI();setGuide(false);cutPair=null;syncResultButtons();leaveBed();(transform.detach(),gizmoTarget=null);root.clear();root.position.set(0,0,0);root.rotation.set(0,0,0);root.scale.set(1,1,1);meshes=[];selected=null;undo=[];redo=[];basePositions.clear();explodeOrigins.clear();originalMaterials.clear();modelLoaded=false;dirty=false;explode=false;xray=false;applyVisualState();updateList();updateStats();resetBeds()}
 function prepare(object,name){clear();root.add(object);root.updateMatrixWorld(true);object.traverse(child=>{if(!child.isMesh)return;if(!child.geometry?.attributes?.position)return;const mat=child.material;if(Array.isArray(mat))child.material=mat.map(m=>m.clone());else child.material=mat?.clone()||new THREE.MeshStandardMaterial({color:0x4da7eb});child.name=child.name||`Pieza ${meshes.length+1}`;meshes.push(child);originalMaterials.set(child.uuid,child.material);basePositions.set(child.uuid,child.position.clone());});modelLoaded=meshes.length>0;loadRaycastAcceleration().then(ok=>{if(ok&&modelLoaded)accelerateSurfaceMeshes(meshes)});$('projectName').value=name;fit();updateList();updateStats();refreshBeds();status(`${meshes.length} objeto(s) de malla cargado(s). Se pueden inspeccionar aunque tengan defectos.`);dirty=true;diagnoseAfterImport()}
-function updateList(){const host=$('pieces');host.replaceChildren();if(!meshes.length){host.textContent='Sin piezas cargadas.';return}meshes.forEach((m,i)=>{const row=document.createElement('div');row.className='piece'+(selected===m?' selected':'');const name=document.createElement('span');name.className='piece-name';name.textContent=`${i+1}. ${m.name}`;name.onclick=()=>select(m);const location=document.createElement('small');location.style.color='#a8c9df';location.textContent=' '+(beds.find(b=>b.items.includes(m.uuid))?.name||'Sin cama');const eye=document.createElement('button');eye.textContent=m.visible?'◉':'○';eye.title='Mostrar/ocultar';eye.onclick=()=>{save();m.visible=!m.visible;updateList();if(bedMode)updateBedStage()};row.append(name,location,eye);host.append(row)})}
+let bvhTimer=0;function scheduleAcceleration(){clearTimeout(bvhTimer);bvhTimer=setTimeout(()=>loadRaycastAcceleration().then(ok=>{if(ok&&modelLoaded)accelerateSurfaceMeshes(meshes)}),400);}
+function updateList(){scheduleAcceleration();const host=$('pieces');host.replaceChildren();if(!meshes.length){host.textContent='Sin piezas cargadas.';return}meshes.forEach((m,i)=>{const row=document.createElement('div');row.className='piece'+(selected===m?' selected':'');const name=document.createElement('span');name.className='piece-name';name.textContent=`${i+1}. ${m.name}`;name.onclick=()=>select(m);const location=document.createElement('small');location.style.color='#a8c9df';location.textContent=' '+(beds.find(b=>b.items.includes(m.uuid))?.name||'Sin cama');const eye=document.createElement('button');eye.className='ojo'+(m.visible?'':' apagado');eye.innerHTML='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';eye.setAttribute('aria-label',m.visible?'Ocultar pieza':'Mostrar pieza');eye.title='Mostrar/ocultar';eye.onclick=()=>{save();m.visible=!m.visible;updateList();if(bedMode)updateBedStage()};const swatch=document.createElement('span');swatch.className='muestra';const mat0=Array.isArray(m.material)?m.material[0]:m.material;swatch.style.background='#'+(mat0?.color?.getHexString?.()||'8aa');const more=document.createElement('button');more.className='mas';more.textContent='⋮';more.setAttribute('aria-label','Opciones de '+m.name);more.onclick=()=>{select(m);window.dispatchEvent(new Event('bisturi-menu-pieza'))};row.append(swatch,name,location,eye,more);host.append(row)})}
 // Doble toque con la herramienta Seleccionar: quita la selección de pieza.
 {let lastTap=null;let down=null;
 renderer.domElement.addEventListener('pointerdown',e=>{down=e.isPrimary?{x:e.clientX,y:e.clientY,t:performance.now()}:null;});
@@ -559,7 +585,7 @@ renderer.domElement.addEventListener('pointerup',e=>{
   if(lastTap&&now-lastTap.t<350&&Math.hypot(e.clientX-lastTap.x,e.clientY-lastTap.y)<30){lastTap=null;setTimeout(()=>{if(selected)select(null);},0);return;}
   lastTap={x:e.clientX,y:e.clientY,t:now};
 });}
-function select(m){if(surfacePreview&&surfacePreview.meshId!==m?.uuid)clearSurfacePreview();selected=m;refreshCutGuide();transform.detach();if(!bedMode&&tool==='Mover'&&m)transform.attach(m);updateList();refreshBeds();syncPlacementFields();status(m?`Seleccionado: ${m.name}`:'Selección eliminada')}
+function select(m){if(surfacePreview&&surfacePreview.meshId!==m?.uuid)clearSurfacePreview();selected=m;refreshCutGuide();(transform.detach(),gizmoTarget=null);if(!bedMode&&tool==='Mover'&&m)attachGizmo(m);updateList();refreshBeds();syncPlacementFields();status(m?`Seleccionado: ${m.name}`:'Selección eliminada')}
 function updateStats(){meshQualityLast=[];if($('qualityResults'))$('qualityResults').textContent='Modelo modificado. Vuelve a comprobar las piezas.';if(!modelLoaded){$('stats').textContent='Sin modelo';return}root.updateMatrixWorld(true);const b=new THREE.Box3().setFromObject(root),s=b.getSize(new THREE.Vector3());let triangles=0;meshes.forEach(m=>{const g=m.geometry;triangles+=g.index?g.index.count/3:g.attributes.position.count/3});$('stats').textContent=`Objetos de malla: ${meshes.length}\nTriángulos aprox.: ${Math.round(triangles).toLocaleString('es')}\nDimensiones (mm, si el archivo usa mm): ${s.x.toFixed(1)} × ${s.y.toFixed(1)} × ${s.z.toFixed(1)}\nModo: ${mode}\nHerramienta: ${tool}`}
 const ray=new THREE.Raycaster(),pointer=new THREE.Vector2();let start=null;renderer.domElement.addEventListener('pointerdown',e=>{if(!e.isPrimary||surfaceDrag||planeDrag||pegDrag||touchPlaneActive||pegTouchActive||['Pincel','Varita','Magnético'].includes(tool)){start=null;return;}start={x:e.clientX,y:e.clientY,id:e.pointerId};if(bedMode&&e.isPrimary&&!dragBed){const rect=renderer.domElement.getBoundingClientRect();pointer.set((e.clientX-rect.left)/rect.width*2-1,-(e.clientY-rect.top)/rect.height*2+1);ray.setFromCamera(pointer,camera);const hits=ray.intersectObjects([...stagePick.keys()],false);if(hits.length){const item=stagePick.get(hits[0].object);if(item){const m=item.mesh;activeBed=item.bed.id;refreshBeds();select(m);const p=bedPointer(e);const place=item.bed.placements[m.uuid];const off=bedOffsets.get(item.bed.id)||{x:0,z:0};if(p&&place){save();dragBed={pointerId:e.pointerId,id:m.uuid,bedId:item.bed.id,initial:{...place},dx:place.x-(p.x-off.x),dy:place.y-(p.y-off.z)};orbit.enabled=false;renderer.domElement.setPointerCapture(e.pointerId)}}}}});renderer.domElement.addEventListener('pointermove',e=>{if(!dragBed||e.pointerId!==dragBed.pointerId)return;const p=bedPointer(e);if(!p)return;const b=beds.find(v=>v.id===dragBed.bedId);if(!b)return;const place=b.placements[dragBed.id];if(!place)return;const off=bedOffsets.get(b.id)||{x:0,z:0};place.x=Math.round((p.x-off.x+dragBed.dx)*10)/10;place.y=Math.round((p.y-off.z+dragBed.dy)*10)/10;updateBedStage();drawBed();syncPlacementFields();dirty=true});renderer.domElement.addEventListener('pointercancel',e=>{if(!dragBed||e.pointerId!==dragBed.pointerId)return;restoreDragPlacement(beds,dragBed);dragBed=null;start=null;orbit.enabled=true;if(bedMode)refreshBeds();status('Movimiento interrumpido; pieza restaurada.');});renderer.domElement.addEventListener('pointerup',e=>{if(surfaceDrag||planeDrag||pegDrag||touchPlaneActive||pegTouchActive||['Pincel','Varita','Magnético'].includes(tool)){start=null;return;}if(dragBed){
 
@@ -662,16 +688,24 @@ function loadPebbleExample(){
 $('demoMushroomBtn').onclick=loadMushroomExample;$('demoPebbleBtn').onclick=loadPebbleExample;
 $('scaleBtn').onclick=()=>{if(!modelLoaded)return status('Primero carga un modelo.');const h=Number($('height').value);if(!Number.isFinite(h)||h<=0)return status('Introduce una altura válida en centímetros.');const box=new THREE.Box3().setFromObject(root),size=box.getSize(new THREE.Vector3());if(size.y<=0)return status('El modelo no tiene altura válida.');save();root.scale.multiplyScalar(h*10/size.y);fit();updateStats();status(`Altura ajustada proporcionalmente a ${h} cm (asumiendo unidades del modelo en mm).`)};
 document.querySelectorAll('.mode').forEach(b=>b.onclick=()=>{mode=b.dataset.mode;document.querySelectorAll('.mode').forEach(x=>x.classList.toggle('active',x===b));updateStats();status('Modo '+mode+': las operaciones de segmentación se añadirán en próximas versiones.')});
-function setTool(t){if(surfaceSelector.busy())cancelSurfaceWork();if(bedMode){leaveBed();}tool=t;transform.detach();if(t==='Mover'&&selected&&!explode)transform.attach(selected);if(t==='Mover'&&explode)status('Reúne las piezas antes de moverlas para conservar su posición real.');$('selectTool').classList.toggle('active',t==='Seleccionar');$('moveTool').classList.toggle('active',t==='Mover');$('brushTool').classList.toggle('active',t==='Pincel');$('wandTool').classList.toggle('active',t==='Varita');updateStats()}
-$('selectTool').onclick=()=>setTool('Seleccionar');$('moveTool').onclick=()=>setTool('Mover');transform.addEventListener('mouseDown',()=>save());transform.addEventListener('objectChange',()=>{dirty=true;updateStats()});
+function setTool(t){if(surfaceSelector.busy())cancelSurfaceWork();if(bedMode){leaveBed();}tool=t;(transform.detach(),gizmoTarget=null);if(t==='Mover'&&selected&&!explode)attachGizmo(selected);if(t==='Mover'&&explode)status('Reúne las piezas antes de moverlas para conservar su posición real.');$('selectTool').classList.toggle('active',t==='Seleccionar');$('moveTool').classList.toggle('active',t==='Mover');$('brushTool').classList.toggle('active',t==='Pincel');$('wandTool').classList.toggle('active',t==='Varita');updateStats()}
+$('selectTool').onclick=()=>setTool('Seleccionar');$('moveTool').onclick=()=>setTool('Mover');transform.addEventListener('mouseDown',()=>save());let statsQueued=false;
+transform.addEventListener('objectChange',()=>{dirty=true;if(!statsQueued){statsQueued=true;requestAnimationFrame(()=>{statsQueued=false;updateStats();});}});
+// Resolución adaptable: mientras se gira la vista o se mueve una pieza se dibuja con menos píxeles.
+const fullPixelRatio=Math.min(devicePixelRatio,2);let lowResTimer=0;
+function sceneTriangles(){let n=0;for(const m of meshes){const g=m.geometry;n+=(g.index?g.index.count:g.attributes.position.count)/3;}return n;}
+function interactionStart(){clearTimeout(lowResTimer);const n=sceneTriangles();if(n<150000)return;const low=n>1500000?.6:n>600000?.8:1;if(renderer.getPixelRatio()!==low){renderer.setPixelRatio(low);resize();}}
+function interactionEnd(){clearTimeout(lowResTimer);lowResTimer=setTimeout(()=>{if(renderer.getPixelRatio()!==fullPixelRatio){renderer.setPixelRatio(fullPixelRatio);resize();}},250);}
+orbit.addEventListener('start',interactionStart);orbit.addEventListener('end',interactionEnd);
+transform.addEventListener('dragging-changed',e=>e.value?interactionStart():interactionEnd());
 $('xrayBtn').onclick=()=>{if(!modelLoaded)return;save();xray=!xray;applyVisualState();dirty=true};
-$('explodeBtn').onclick=()=>{if(!modelLoaded)return;save();if(!explode){explodeOrigins=new Map(meshes.map(m=>[m.uuid,m.position.clone()]));explode=true;transform.detach();const box=new THREE.Box3().setFromObject(root),center=box.getCenter(new THREE.Vector3()),dist=box.getSize(new THREE.Vector3()).length()*.22;meshes.forEach((m,i)=>{const world=new THREE.Vector3();m.getWorldPosition(world);const v=world.sub(center);if(v.length()<.01)v.set(Math.cos(i*2.4),.4,Math.sin(i*2.4));const localDelta=v.normalize().multiplyScalar(dist);if(m.parent){const parentScale=new THREE.Vector3();m.parent.getWorldScale(parentScale);localDelta.applyQuaternion(m.parent.getWorldQuaternion(new THREE.Quaternion()).invert());localDelta.set(localDelta.x/Math.max(1e-6,parentScale.x),localDelta.y/Math.max(1e-6,parentScale.y),localDelta.z/Math.max(1e-6,parentScale.z))}m.position.add(localDelta)})}else{meshes.forEach(m=>{const pos=explodeOrigins.get(m.uuid);if(pos)m.position.copy(pos)});explodeOrigins.clear();explode=false;if(tool==='Mover'&&selected&&!bedMode)transform.attach(selected)}applyVisualState();refreshCutGuide();syncResultButtons();updateStats();dirty=true};
+$('explodeBtn').onclick=()=>{if(!modelLoaded)return;save();if(!explode){explodeOrigins=new Map(meshes.map(m=>[m.uuid,m.position.clone()]));explode=true;(transform.detach(),gizmoTarget=null);const box=new THREE.Box3().setFromObject(root),center=box.getCenter(new THREE.Vector3()),dist=box.getSize(new THREE.Vector3()).length()*.22;meshes.forEach((m,i)=>{const world=new THREE.Vector3();m.getWorldPosition(world);const v=world.sub(center);if(v.length()<.01)v.set(Math.cos(i*2.4),.4,Math.sin(i*2.4));const localDelta=v.normalize().multiplyScalar(dist);if(m.parent){const parentScale=new THREE.Vector3();m.parent.getWorldScale(parentScale);localDelta.applyQuaternion(m.parent.getWorldQuaternion(new THREE.Quaternion()).invert());localDelta.set(localDelta.x/Math.max(1e-6,parentScale.x),localDelta.y/Math.max(1e-6,parentScale.y),localDelta.z/Math.max(1e-6,parentScale.z))}m.position.add(localDelta)})}else{meshes.forEach(m=>{const pos=explodeOrigins.get(m.uuid);if(pos)m.position.copy(pos)});explodeOrigins.clear();explode=false;if(tool==='Mover'&&selected&&!bedMode)attachGizmo(selected)}applyVisualState();refreshCutGuide();syncResultButtons();updateStats();dirty=true};
 // Cortes por plano en ejes mundiales o normal inclinada (experimental).
 $('previewCutBtn').onclick=()=>setGuide(!showCutGuide);
 $('touchPlaneBtn').onclick=togglePlaneTouch;
 $('mobileTouchPlane').onclick=()=>{if($('cutOrientation').value!==$('mobileCutOrientation').value){$('cutOrientation').value=$('mobileCutOrientation').value;$('cutAngles').hidden=$('cutOrientation').value!=='inclinado'}$('cutPercent').value=$('mobileCutPercent').value;$('cutAngleX').value=$('mobileCutAngleX').value;$('cutAngleZ').value=$('mobileCutAngleZ').value;togglePlaneTouch();};
 $('showCutResult').onclick=()=>$('explodeBtn').click();
-$('cutPlaneBtn').onclick=()=>{
+$('cutPlaneBtn').onclick=async()=>{
   if(bedMode)return status('Vuelve a la vista de modelo antes de cortar.');
   if(!selected)return status('Selecciona una malla para cortarla.');
   if(explode)return status('Desactiva la vista explotada antes de cortar.');
@@ -690,10 +724,12 @@ $('cutPlaneBtn').onclick=()=>{
     normal=new THREE.Vector3(0,1,0).applyEuler(new THREE.Euler(THREE.MathUtils.degToRad(angleX),0,THREE.MathUtils.degToRad(angleZ),'XYZ'));
   }else normal=new THREE.Vector3(0,1,0);
   let result;
+  const triCount=(m.geometry.index?m.geometry.index.count:m.geometry.attributes.position.count)/3;
+  if(triCount>150000){status(`Cortando ${Math.round(triCount).toLocaleString('es')} triángulos… puede tardar unos segundos.`);$('cutPlaneBtn').disabled=true;await new Promise(r=>requestAnimationFrame(()=>setTimeout(r,30)));$('cutPlaneBtn').disabled=false;if(selected!==m||!meshes.includes(m))return status('La selección cambió; vuelve a pulsar «Aplicar corte por plano».');}
   try{result=sliceMeshByWorldPlane(m,normal,fraction)}catch(e){status('No se aplicó el corte: '+e.message);return}
   try{
-    requireClosedResult(result.upper,'Mitad superior');
-    requireClosedResult(result.lower,'Mitad inferior');
+    // El corte del núcleo ya comprobó ambas mitades con el mismo análisis; no se repite en mallas grandes.
+    if(!result.largeMesh){requireClosedResult(result.upper,'Mitad superior');requireClosedResult(result.lower,'Mitad inferior');}
     assertCutVolumeConservation(m.geometry,result.upper,result.lower);
     m.updateWorldMatrix(true,false);
     const worldPoint=new THREE.Vector3();
@@ -701,13 +737,14 @@ $('cutPlaneBtn').onclick=()=>{
       offset:result.planeOffset,
       project:(x,y,z)=>normal.dot(worldPoint.set(x,y,z).applyMatrix4(m.matrixWorld))
     });
-    assertMatchingCutSeams(result.upper,result.lower,{
+    // El corte del núcleo ya comprobó las caras nuevas de cada cuerpo cortado (los cuerpos que solo tocan el plano no tienen cara nueva).
+    if(!result.largeMesh)assertMatchingCutSeams(result.upper,result.lower,{
       offset:result.planeOffset,
       project:(x,y,z)=>normal.dot(worldPoint.set(x,y,z).applyMatrix4(m.matrixWorld))
     });
   }
   catch(e){result.upper.dispose();result.lower.dispose();status('Corte cancelado: '+e.message);return}
-  setGuide(false);save();transform.detach();
+  setGuide(false);save();(transform.detach(),gizmoTarget=null);
   const sourceBed=beds.find(b=>b.items.includes(m.uuid));
   const sourceMaterials=Array.isArray(m.material)?m.material:[m.material];
   const make=(geo,which,color)=>{
@@ -721,32 +758,40 @@ $('cutPlaneBtn').onclick=()=>{
   const positive=make(result.upper,'lado positivo',0x56b9ef);
   const negative=make(result.lower,'lado negativo',0xae83e8);
   if(result.connectorPoint){
-    const info={point:result.connectorPoint.toArray(),normal:result.connectorNormal.toArray(),maxRadius:result.connectorRadius};
+    positive.updateWorldMatrix(true,false);const invCut=positive.matrixWorld.clone().invert();
+    const info={point:result.connectorPoint.toArray(),normal:result.connectorNormal.toArray(),maxRadius:result.connectorRadius,
+      localPoint:result.connectorPoint.clone().applyMatrix4(invCut).toArray(),localNormal:result.connectorNormal.clone().transformDirection(invCut).toArray()};
     positive.userData.bisturiCut={...info,mate:negative.uuid,side:'positive'};
     negative.userData.bisturiCut={...info,mate:positive.uuid,side:'negative'};
   }
   m.removeFromParent();meshes.splice(meshes.indexOf(m),1,positive,negative);
   if(sourceBed){sourceBed.items=sourceBed.items.filter(id=>id!==m.uuid);delete sourceBed.placements[m.uuid]}
-  disablePegTouch();pegCustomOffsets=null;clearPegMarkers();selected=positive;cutPair=[positive,negative];syncResultButtons();dirty=true;refreshBeds();updateList();updateStats();fit();
-  status(`Corte ${axis} efectuado: dos mallas separadas. Revisa que sus superficies sean válidas en el laminador.`);
+  disablePegTouch();pegCustomOffsets=null;pegAutoInfo=null;clearPegMarkers();selected=positive;cutPair=[positive,negative];syncResultButtons();dirty=true;refreshBeds();updateList();updateStats();fit();
+  status(`Corte ${axis} efectuado: dos mallas separadas. `+(result.warning||`Revisa que sus superficies sean válidas en el laminador.`));
 };
 
 // Encastres experimentales: distribución lineal en plano y operaciones CSG reales.
 // La zona segura es una estimación conservadora del algoritmo de corte, no una prueba manifold.
 const pegMarkers=new THREE.Group();scene.add(pegMarkers);
-let pegTouchActive=false, pegDrag=null, pegCustomOffsets=null;
+let pegTouchActive=false, pegDrag=null, pegCustomOffsets=null, pegAutoInfo=null, pegFastPreview=false;
 const pegPointerRay=new THREE.Raycaster(),pegPointerNdc=new THREE.Vector2();
 function pegPointFromPointer(event){
   const rect=renderer.domElement.getBoundingClientRect();
   pegPointerNdc.set((event.clientX-rect.left)/rect.width*2-1,-(event.clientY-rect.top)/rect.height*2+1);
   pegPointerRay.setFromCamera(pegPointerNdc,camera);
 }
-function pegAxes(info){
-  const normal=new THREE.Vector3().fromArray(info.normal).normalize();
+// Plano del corte en el mundo según la posición actual de una mitad (si se movió, el plano la acompaña).
+function cutFrame(info,mesh){
+  mesh=mesh||meshes.find(x=>x.userData?.bisturiCut===info);
+  if(mesh&&info.localPoint){mesh.updateWorldMatrix(true,false);return {point:new THREE.Vector3().fromArray(info.localPoint).applyMatrix4(mesh.matrixWorld),normal:new THREE.Vector3().fromArray(info.localNormal).transformDirection(mesh.matrixWorld).normalize()};}
+  return {point:new THREE.Vector3().fromArray(info.point),normal:new THREE.Vector3().fromArray(info.normal).normalize()};
+}
+function pegAxes(info,mesh){
+  const frame=cutFrame(info,mesh),normal=frame.normal;
   const guide=Math.abs(normal.y)<.9?new THREE.Vector3(0,1,0):new THREE.Vector3(1,0,0);
   const tangent=new THREE.Vector3().crossVectors(normal,guide).normalize();
   const bitangent=new THREE.Vector3().crossVectors(normal,tangent).normalize();
-  return {normal,tangent,bitangent,point:new THREE.Vector3().fromArray(info.point)};
+  return {normal,tangent,bitangent,point:frame.point};
 }
 function disablePegTouch(){
   pegTouchActive=false;pegDrag=null;orbit.enabled=true;
@@ -763,17 +808,21 @@ function syncConnectorShape(){
   $('rectFields').hidden=!isProfile;
   $('dovetailFields').hidden=$('pegShape').value!=='dovetail';
   $('pegDiameterLabel').hidden=isProfile;
-  pegCustomOffsets=null;disablePegTouch();clearPegMarkers();
+  const dv=$('pegShape').value==='dovetail',lw=$('rectWidth').closest('label'),lh=$('rectHeight').closest('label');
+  if(dv&&$('rectWidth').value==='5'&&$('rectHeight').value==='4'){$('rectWidth').value='8';$('rectHeight').value='10';$('dovetailTaper').value='1.5';}
+  lw.firstChild.textContent=dv?'Ancho máximo del riel (mm)':'Ancho rectangular (mm)';lh.firstChild.textContent=dv?'Largo del riel (mm)':'Alto rectangular (mm)';
+  $('pegCount').closest('label').firstChild.textContent=dv?'Cantidad de rieles':'Cantidad de pasadores';
+  pegCustomOffsets=null;pegAutoInfo=null;disablePegTouch();clearPegMarkers();
   $('pegPreviewInfo').textContent='Elige Ver ubicación de pasadores para revisar la geometría.';
 }
 $('pegShape').addEventListener('change',syncConnectorShape);
-['rectWidth','rectHeight','dovetailTaper'].forEach(id=>$(id).addEventListener('input',()=>{pegCustomOffsets=null;disablePegTouch();clearPegMarkers();}));
+['rectWidth','rectHeight','dovetailTaper'].forEach(id=>$(id).addEventListener('input',()=>{pegCustomOffsets=null;pegAutoInfo=null;disablePegTouch();clearPegMarkers();}));
 function pegConfig(){
   const shape=$('pegShape').value;
   if(!['circular','rectangular','dovetail','alignment'].includes(shape))throw Error('Tipo de encastre no válido.');
   const width=Number($('rectWidth').value),height=Number($('rectHeight').value);
   if(['rectangular','dovetail'].includes(shape)&&(!Number.isFinite(width)||!Number.isFinite(height)||width<.5||height<.5||width>40||height>40))throw Error('Ancho y alto rectangulares deben estar entre 0.5 y 40 mm.');
-  const diameter=['rectangular','dovetail'].includes(shape)?Math.hypot(width,height):Number($('pegDiameter').value),depth=Number($('pegDepth').value),clearance=Number($('pegClearance').value);
+  const diameter=shape==='dovetail'?Math.hypot(width+0.5,2*height+0.5):shape==='rectangular'?Math.hypot(width,height):Number($('pegDiameter').value),depth=Number($('pegDepth').value),clearance=Number($('pegClearance').value);
   const count=Number($('pegCount').value),spacing=Number($('pegSpacing').value),u=Number($('pegOffsetU').value),v=Number($('pegOffsetV').value);
   if(![diameter,depth,clearance,count,spacing,u,v].every(Number.isFinite)||diameter<.5||diameter>40||depth<1||depth>40||clearance<.05||clearance>1||diameter/2<=clearance||!Number.isInteger(count)||count<1||count>4||Math.abs(u)>100||Math.abs(v)>100||spacing<1||spacing>100)throw Error('Revisa cantidad, diámetro, profundidad, holgura, separación y desplazamientos.');
   if(count>1&&spacing<diameter+2*clearance+1)throw Error('Los pasadores se solapan o están demasiado próximos. Aumenta la separación.');
@@ -787,17 +836,59 @@ function pegConfig(){
 }
 function pegPositions(info,c){
   const {normal,point,tangent,bitangent}=pegAxes(info);
-  const centers=[],offsets=[];
-  for(let i=0;i<c.count;i++){
-    const [du,dv]=pegCustomOffsets?.length===c.count?pegCustomOffsets[i]:[c.u+(i-(c.count-1)/2)*c.spacing,c.v];
-    if(Math.hypot(du,dv)+c.diameter/2+c.clearance>info.maxRadius*.8)throw Error('Algún pasador queda fuera del área segura estimada. Reduce separación, tamaño o desplazamiento.');
+  const centers=[],offsets=[],v2f=usesV2f(c);
+  // Con pasadores redondos, la ubicación automática la decide el motor de la primera versión.
+  const list=(pegCustomOffsets?.length&&(v2f||pegCustomOffsets.length===c.count))?pegCustomOffsets:(v2f&&pegAutoInfo?.offsets?.length)?pegAutoInfo.offsets:null;
+  const count=list?list.length:c.count;
+  for(let i=0;i<count;i++){
+    // Reparto por defecto: en fila (2), triángulo (3) o cuadrado (4), centrado en el punto elegido.
+    const auto=c.count===3?(()=>{const r=c.spacing/Math.sqrt(3),a=Math.PI/2+i*2*Math.PI/3;return [c.u+r*Math.cos(a),c.v+r*Math.sin(a)]})():c.count===4?[c.u+(i%2?.5:-.5)*c.spacing,c.v+(i<2?-.5:.5)*c.spacing]:[c.u+(i-(c.count-1)/2)*c.spacing,c.v];
+    const [du,dv]=list?list[i]:auto;
+    if(!v2f&&Math.hypot(du,dv)+c.diameter/2+c.clearance>info.maxRadius*.8)throw Error(c.shape==='dovetail'?'La cola de milano no cabe en la cara del corte: necesita el doble del largo del riel (canal y entrada). Acorta el riel o corta por una zona más ancha.':'Algún encastre queda fuera de la cara del corte. Reduce separación, tamaño o desplazamiento.');
     offsets.push([du,dv]);
     centers.push(point.clone().addScaledVector(tangent,du).addScaledVector(bitangent,dv));
   }
-  for(let i=0;i<centers.length;i++)for(let j=i+1;j<centers.length;j++){
+  if(!v2f)for(let i=0;i<centers.length;i++)for(let j=i+1;j<centers.length;j++){
     if(centers[i].distanceTo(centers[j])<c.diameter+2*c.clearance+1)throw Error('Dos pasadores están demasiado próximos. Sepáralos antes de aplicar.');
   }
   return {normal,centers,offsets};
+}
+// ---- Pasadores redondos con el motor de la primera versión (v2f) ----
+// Busca la tapa común de las dos mitades, pone el encastre en el punto con más material
+// alrededor, el agujero en la mitad más gruesa y ajusta la profundidad al grosor real.
+// Solo rehace la tapa del corte: no exige que el resto de la malla esté perfecta.
+function usesV2f(c){return c.shape==='circular'||c.shape==='alignment'}
+function soupInFrame(mesh,M){
+  const g=mesh.geometry,p=g.getAttribute('position'),idx=g.getIndex(),n=idx?idx.count:p.count,out=new Float32Array(n*3),e=M.elements;
+  for(let i=0;i<n;i++){const k=idx?idx.getX(i):i,x=p.getX(k),y=p.getY(k),z=p.getZ(k);out[3*i]=e[0]*x+e[4]*y+e[8]*z+e[12];out[3*i+1]=e[1]*x+e[5]*y+e[9]*z+e[13];out[3*i+2]=e[2]*x+e[6]*y+e[10]*z+e[14];}
+  return out;
+}
+function geometryFromSoup(sopa,col,inv){
+  const nf=sopa.length/9,order=Array.from({length:nf},(_,i)=>i);order.sort((a,b)=>col[a]-col[b]);
+  const out=new Float32Array(nf*9),e=inv.elements,g=new THREE.BufferGeometry();
+  order.forEach((f,i)=>{for(let k=0;k<3;k++){const o=9*f+3*k,x=sopa[o],y=sopa[o+1],z=sopa[o+2],d=9*i+3*k;out[d]=e[0]*x+e[4]*y+e[8]*z+e[12];out[d+1]=e[1]*x+e[5]*y+e[9]*z+e[13];out[d+2]=e[2]*x+e[6]*y+e[10]*z+e[14];}});
+  let start=0;for(let i=1;i<=nf;i++)if(i===nf||col[order[i]]!==col[order[start]]){g.addGroup(3*start,3*(i-start),Math.max(0,col[order[start]]));start=i;}
+  g.setAttribute('position',new THREE.Float32BufferAttribute(out,3));g.computeVertexNormals();g.computeBoundingBox();return g;
+}
+function v2fManual(c){return !!(pegCustomOffsets?.length)||c.u!==0||c.v!==0}
+function runV2f(pair,c,{soloUbicar=false,evitar=null}={}){
+  const {m,mate,info}=pair;
+  m.updateWorldMatrix(true,false);mate.updateWorldMatrix(true,false);
+  // Las dos mitades comparten el marco local del modelo original: se usan juntas aunque se hayan movido.
+  const M=m.matrixWorld.clone();
+  const pieces=[m,mate].map(mesh=>{const col=faceMaterials(mesh.geometry);return {sopa:soupInFrame(mesh,M),col,colNuevo:col[mainFaceIndex(mesh.geometry)]??0}});
+  const frame=cutFrame(info,m),minWall=Number($('pegMinWall').value);
+  if(!Number.isFinite(minWall)||minWall<0.6||minWall>10)throw Error('El espesor mínimo debe estar entre 0.6 y 10 mm.');
+  const J={tipo:c.shape==='alignment'?'pasadores':'macho',d:c.diameter,profundidad:c.shape==='alignment'?c.depth/2:c.depth+0.5,holgura:2*c.clearance,pared:minWall,cantidad:c.count};
+  let centros=null;
+  if(v2fManual(c)){const saved=pegAutoInfo;pegAutoInfo=null;centros=pegPositions(info,c).centers.map(v=>v.toArray());pegAutoInfo=saved;}
+  const r=encastresEnCorte(pieces,J,{plano:{punto:frame.point.toArray(),normal:frame.normal.toArray()},centros,soloUbicar,separacion:0,evitar});
+  if(!r.ubicaciones.length){
+    if(evitar&&(evitar[0].length||evitar[1].length))r.motivo='tapa-defectuosa';
+    const why=r.motivo==='sin-tapa'?'No encuentro la tapa plana común de las dos mitades. Junta las mitades (Atrás) o vuelve a cortar.':r.motivo==='tapa-defectuosa'?'La cara del corte tiene defectos (grietas o cáscaras superpuestas) justo donde cabría el encastre. Mueve el plano de corte unos milímetros y vuelve a intentarlo.':r.motivo==='poco-grosor'?`La pieza es demasiado delgada en la zona del corte para un encastre de ${J.profundidad.toFixed(1)} mm con pared de ${minWall} mm: baja la profundidad o la pared.`:`No cabe un encastre de Ø${c.diameter} mm con pared de ${minWall} mm en la cara del corte: baja el diámetro o la pared.`;
+    const z=diagEncastre.zonas;throw Error(why+(z?` [zonas sanas: ${z[0]}/${z[1]} y ${z[2]}/${z[3]}]`:''));
+  }
+  return {r,M,pieces,J,m,mate};
 }
 function selectedCutPair(){
   const m=selected,info=m?.userData?.bisturiCut;
@@ -811,14 +902,48 @@ $('pegPreviewBtn').onclick=()=>{
   clearPegMarkers();
   if(bedMode||explode||xray)return status('Regresa a la vista ensamblada sin Rayos X para previsualizar pasadores.');
   try{
-    const {info}=selectedCutPair(),c=pegConfig(),{normal,centers}=pegPositions(info,c);
+    const pair=selectedCutPair(),{m,info}=pair,c=pegConfig();
+    let note='';
+    if(usesV2f(c)&&!pegFastPreview){
+      // Ubicación automática (o ajuste de la pedida) con el motor de la primera versión.
+      const {r}=runV2f(pair,c,{soloUbicar:true}),ax=pegAxes(info);
+      const offs=r.ubicaciones.map(u=>{const d=new THREE.Vector3(...u.centro).sub(ax.point);return [Math.round(d.dot(ax.tangent)*100)/100,Math.round(d.dot(ax.bitangent)*100)/100]});
+      pegAutoInfo={offsets:offs,ubic:r.ubicaciones,normal:new THREE.Vector3(...r.normal)};
+      if(pegCustomOffsets?.length)pegCustomOffsets=offs.map(x=>[...x]);
+      const moved=r.ubicaciones.filter(u=>u.movido>0.05).length;
+      if(moved)note+=` ${moved} se movió al punto válido más cercano (no cabía donde estaba).`;
+      if(r.ubicaciones.length<c.count)note+=` Solo caben ${r.ubicaciones.length} de ${c.count} con esta medida y pared.`;
+    }
+    const {normal,centers}=pegPositions(info,c);
+    // Vista previa: en ámbar el pasador/riel que se añade; en celeste el contorno del alojamiento.
+    const male=connectorShapesFor(info,m,m,centers,c.shape==='alignment'?{...c,shape:'circular'}:c,'male');
+    const female=connectorShapesFor(info,m,m,centers,c.shape==='alignment'?{...c,shape:'circular'}:c,'female');
+    const prismMesh=(shape,depthDir,depth)=>{
+      const base=Array.isArray(shape)?shape:shape.base,top=Array.isArray(shape)?shape.map(p=>p.map((v,k)=>v+depthDir[k]*depth)):shape.tope,L=base.length,pos=[];
+      const tri=(a,b,c)=>pos.push(...a,...b,...c);
+      for(let i=0;i<L;i++){const j=(i+1)%L;tri(base[i],base[j],top[j]);tri(base[i],top[j],top[i]);}
+      for(let i=1;i<L-1;i++){tri(base[0],base[i],base[i+1]);tri(top[0],top[i+1],top[i]);}
+      const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));g.computeVertexNormals();return g;
+    };
+    const down=normal.clone().negate().toArray();
     centers.forEach((center,index)=>{
-      const marker=new THREE.Mesh((c.shape==='dovetail'?dovetailGeometry(THREE,c.width,c.height,Math.max(c.depth,1),c.taper):c.shape==='rectangular'?new THREE.BoxGeometry(c.width,Math.max(c.depth,1),c.height):cylindricalGeometry(THREE,c.diameter/2,Math.max(c.depth,1),24)),new THREE.MeshBasicMaterial({color:0xffdf71,wireframe:true,depthTest:false,transparent:true,opacity:.9}));
-      marker.position.copy(center).addScaledVector(normal,-c.depth/2);marker.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),normal);marker.renderOrder=30;marker.userData.pegIndex=index;pegMarkers.add(marker);
-      const handle=new THREE.Mesh(new THREE.SphereGeometry(Math.max(c.diameter*.45,2),16,12),new THREE.MeshBasicMaterial({color:0xffcb37,depthTest:false,transparent:true,opacity:.95}));
-      handle.position.copy(center).addScaledVector(normal,Math.max(c.diameter*.05,.1));handle.userData.pegIndex=index;handle.userData.pegHandle=true;handle.renderOrder=31;pegMarkers.add(handle);
+      const U=usesV2f(c)?pegAutoInfo?.ubic?.[index]:null,nOut=pegAutoInfo?.normal;
+      if(U&&nOut){
+        // Ámbar: el pin (macho) o el pasador suelto; entra en la mitad del agujero.
+        const mk=(dir,depth)=>{const solid=new THREE.Mesh(prismMesh(male.shapes[index],dir,depth),new THREE.MeshBasicMaterial({color:0xffb020,transparent:true,opacity:.55,depthTest:false,side:THREE.DoubleSide}));solid.renderOrder=30;solid.userData.pegIndex=index;pegMarkers.add(solid)};
+        if(U.hembra==='ambas'){mk(nOut.clone().negate().toArray(),U.profundidad[0]);mk(nOut.toArray(),U.profundidad[1]);}
+        else mk((U.hembra===0?nOut.clone().negate():nOut).toArray(),U.profundidad[1]);
+      }else if(c.shape!=='alignment'){
+        const solid=new THREE.Mesh(prismMesh(male.shapes[index],down,c.depth),new THREE.MeshBasicMaterial({color:0xffb020,transparent:true,opacity:.55,depthTest:false,side:THREE.DoubleSide}));
+        solid.renderOrder=30;solid.userData.pegIndex=index;pegMarkers.add(solid);
+      }
+      const ring=Array.isArray(female.shapes[index])?female.shapes[index]:female.shapes[index].base;
+      const outline=new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(ring.map(p=>new THREE.Vector3(...p))),new THREE.LineBasicMaterial({color:0x41d2ff,depthTest:false}));
+      outline.renderOrder=31;pegMarkers.add(outline);
+      const handle=new THREE.Mesh(new THREE.SphereGeometry(Math.max(Math.min(c.diameter*.18,2),.8),16,12),new THREE.MeshBasicMaterial({color:0xffcb37,depthTest:false,transparent:true,opacity:.95}));
+      handle.position.copy(center).addScaledVector(normal,.1);handle.userData.pegIndex=index;handle.userData.pegHandle=true;handle.renderOrder=32;pegMarkers.add(handle);
     });
-    $('pegPreviewInfo').textContent=`Vista previa de ${centers.length} pasador(es). Activa «Mover pasadores con el dedo» y arrastra los puntos amarillos.`;
+    $('pegPreviewInfo').textContent=(usesV2f(c)?`${centers.length} encastre(s) en el punto con más material alrededor (como en la primera versión). Ámbar: ${c.shape==='alignment'?'el pasador suelto, entra en las dos mitades':'el pin, entra en la mitad más gruesa'}; celeste: borde del agujero.${note} Puedes moverlos con «Mover pasadores con el dedo».`:'')||(c.shape==='dovetail'?`Vista previa: en ámbar el riel, en celeste el canal con su entrada. Para mover, activa «Mover pasadores con el dedo» y arrastra el punto amarillo.`:`Vista previa de ${centers.length} encastre(s): en ámbar lo que sobresale, en celeste el borde del alojamiento. Para moverlos, activa «Mover pasadores con el dedo» y arrastra los puntos amarillos.`);
     status('Ubicación de pasadores visible. Confirma con Agregar pasador y alojamiento.');
   }catch(e){$('pegPreviewInfo').textContent=e.message;status(e.message)}
 };
@@ -831,7 +956,7 @@ $('pegTouchBtn').onclick=()=>{
   catch(e){status(e.message)}
 };
 $('pegResetBtn').onclick=()=>{
-  pegCustomOffsets=null;disablePegTouch();clearPegMarkers();
+  pegCustomOffsets=null;pegAutoInfo=null;disablePegTouch();clearPegMarkers();
   $('pegPreviewInfo').textContent='Se recuperó la distribución numérica. Pulsa Ver ubicación para actualizar la vista.';
   status('Distribución de pasadores restablecida.');
 };
@@ -859,7 +984,7 @@ renderer.domElement.addEventListener('pointermove',e=>{
     const next=pegCustomOffsets.map(pair=>[...pair]);
     next[index]=[Math.round(displacement.dot(tangent)*10)/10,Math.round(displacement.dot(bitangent)*10)/10];
     pegCustomOffsets=next;
-    try{pegPositions(info,config);$('pegPreviewBtn').click();$('pegPreviewInfo').textContent=`Pasador ${index+1} situado en (${next[index][0]}, ${next[index][1]}) mm. Posición estimada.`;}
+    try{pegPositions(info,config);pegFastPreview=true;try{$('pegPreviewBtn').click()}finally{pegFastPreview=false}$('pegPreviewInfo').textContent=`Pasador ${index+1} situado en (${next[index][0]}, ${next[index][1]}) mm. Posición estimada.`;}
     catch(err){pegCustomOffsets=pegDrag.previous.map(pair=>[...pair]);$('pegPreviewBtn').click();status(err.message)}
   }
   e.stopImmediatePropagation();e.preventDefault();
@@ -869,181 +994,98 @@ function finishPegDrag(e){
   const previous=pegDrag.previous;pegDrag=null;orbit.enabled=true;
   try{renderer.domElement.releasePointerCapture(e.pointerId)}catch(_){}
   if(e.type==='pointercancel'){pegCustomOffsets=previous.map(pair=>[...pair]);$('pegPreviewBtn').click();status('Movimiento de pasador cancelado; se restauró su posición anterior.')}
-  else status('Posición táctil registrada. Comprueba la vista previa antes de aplicar los encastres.');
+  else{$('pegPreviewBtn').click();status('Posición táctil registrada. Comprueba la vista previa antes de aplicar los encastres.');}
   e.stopImmediatePropagation();e.preventDefault();
 }
 renderer.domElement.addEventListener('pointerup',finishPegDrag,true);
 renderer.domElement.addEventListener('pointercancel',finishPegDrag,true);
 const pegFields=['pegCount','pegSpacing','pegOffsetU','pegOffsetV','pegDiameter','pegDepth','pegClearance','pegMinWall'];
-for(const field of pegFields)$(field).addEventListener('input',()=>{pegCustomOffsets=null;disablePegTouch();clearPegMarkers();$('pegPreviewInfo').textContent='La ubicación ha cambiado. Vuelve a pulsar Ver ubicación de pasadores.'});
+for(const field of pegFields)$(field).addEventListener('input',()=>{pegCustomOffsets=null;pegAutoInfo=null;disablePegTouch();clearPegMarkers();$('pegPreviewInfo').textContent='La ubicación ha cambiado. Vuelve a pulsar Ver ubicación de pasadores.'});
+
+// ---- Encastres exactos (sin booleanas): utilidades compartidas ----
+function connectorFootprint(center,normal,c,grow){
+  const q=new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0),normal),pts=[];
+  let local;
+  if(c.shape==='rectangular'){const w=c.width/2+grow,h=c.height/2+grow;local=[[-w,-h],[w,-h],[w,h],[-w,h]];}
+  else if(c.shape==='dovetail'){local=dovetailOutline({width:c.width+2*grow,height:c.height+2*grow,taper:c.taper}).map(([x,y])=>[x,-y]);}
+  else{const r=c.diameter/2+grow,seg=Math.max(24,Math.min(72,Math.round(r*8)));local=Array.from({length:seg},(_,i)=>{const a=2*Math.PI*i/seg;return [r*Math.cos(a),r*Math.sin(a)]});}
+  for(const [x,z] of local){const v=new THREE.Vector3(x,0,z).applyQuaternion(q).add(center);pts.push([v.x,v.y,v.z]);}
+  return pts;
+}
+function worldSoup(mesh){
+  mesh.updateWorldMatrix(true,false);
+  const g=mesh.geometry,p=g.getAttribute('position'),idx=g.getIndex(),n=idx?idx.count:p.count,out=new Float32Array(n*3),v=new THREE.Vector3();
+  for(let i=0;i<n;i++){v.fromBufferAttribute(p,idx?idx.getX(i):i).applyMatrix4(mesh.matrixWorld);out[3*i]=v.x;out[3*i+1]=v.y;out[3*i+2]=v.z;}
+  return out;
+}
+// Primera cara del material más usado de la pieza: los pasadores y alojamientos toman ese color.
+function mainFaceIndex(geometry){const mat=faceMaterials(geometry),count=new Map();for(const x of mat)count.set(x,(count.get(x)||0)+1);let best=0,n=-1;for(const [k,v] of count)if(v>n){n=v;best=k;}return mat.indexOf(best);}
+function faceMaterials(geometry){
+  const n=(geometry.index?geometry.index.count:geometry.getAttribute('position').count)/3,mat=new Int16Array(n);
+  for(const gr of geometry.groups)for(let f=gr.start/3;f<Math.min(n,(gr.start+gr.count)/3);f++)mat[f]=gr.materialIndex;
+  return mat;
+}
+// Convierte el resultado exacto (mundo) en geometría local de la pieza, con grupos de material.
+function exactToGeometry(result,mesh,materials){
+  const inv=mesh.matrixWorld.clone().invert(),nf=result.tri.length/3,order=Array.from({length:nf},(_,i)=>i);
+  const matOf=f=>{const src=result.fuente[f];return src>=0&&src<materials.length?materials[src]:0};
+  order.sort((a,b)=>matOf(a)-matOf(b));
+  const out=new Float32Array(nf*9),v=new THREE.Vector3(),g=new THREE.BufferGeometry();
+  order.forEach((f,i)=>{for(let k=0;k<3;k++){const vi=result.tri[3*f+k];v.set(result.pos[3*vi],result.pos[3*vi+1],result.pos[3*vi+2]).applyMatrix4(inv);out[9*i+3*k]=v.x;out[9*i+3*k+1]=v.y;out[9*i+3*k+2]=v.z;}});
+  let start=0;for(let i=1;i<=nf;i++)if(i===nf||matOf(order[i])!==matOf(order[start])){g.addGroup(3*start,3*(i-start),matOf(order[start]));start=i;}
+  g.setAttribute('position',new THREE.Float32BufferAttribute(out,3));g.computeVertexNormals();g.computeBoundingBox();return g;
+}
+
+// Formas de los encastres para una mitad concreta, con su posición actual.
+// src: la mitad en cuyo marco se calcularon los centros; half: la mitad a la que se aplican.
+function connectorShapesFor(info,src,half,centersWorld,c,role){
+  src.updateWorldMatrix(true,false);half.updateWorldMatrix(true,false);
+  const toLocal=src.matrixWorld.clone().invert(),axes=pegAxes(info,half);
+  const centers=centersWorld.map(p=>p.clone().applyMatrix4(toLocal).applyMatrix4(half.matrixWorld));
+  const shapes=centers.map(center=>{
+    if(c.shape==='dovetail'){
+      const eje=($('dovetailAxis')?.value==='bitangent'?axes.bitangent:axes.tangent).toArray();
+      const cm=colaDeMilano({centro:center.toArray(),normal:axes.normal.toArray(),eje,ancho:c.width,estrechamiento:c.taper,altura:c.depth,largo:c.height,holgura:c.clearance});
+      return role==='male'?cm.macho:cm.hembra;
+    }
+    return connectorFootprint(center,axes.normal,c,role==='male'?0:c.clearance);
+  });
+  return {plane:{point:axes.point.toArray(),normal:axes.normal.toArray()},normal:axes.normal,shapes,centers};
+}
+// Separa una mitad a lo largo de la normal del corte para que se vean los encastres.
+function separateForReview(piece,normal,distance){
+  const p=piece.getWorldPosition(new THREE.Vector3()).addScaledVector(normal,distance);
+  piece.parent.updateWorldMatrix(true,false);piece.parent.worldToLocal(p);piece.position.copy(p);
+  basePositions.set(piece.uuid,piece.position.clone());piece.updateMatrixWorld(true);
+}
 $('pegApplyBtn').onclick=async()=>{
   if(bedMode||explode||xray)return status('Vuelve a la vista ensamblada del modelo y desactiva Rayos X.');
   let pair,c,positionInfo;
-  try{pair=selectedCutPair();c=pegConfig();positionInfo=pegPositions(pair.info,c)}catch(e){return status(e.message)}
+  try{pair=selectedCutPair();c=pegConfig();if(!usesV2f(c))positionInfo=pegPositions(pair.info,c)}catch(e){return status(e.message)}
+  if(usesV2f(c))return applyV2fConnectors(pair,c);
   if(c.shape==='alignment')return applyLooseAlignmentPins(pair,c,positionInfo);
   const {m,mate,info}=pair,positive=info.side==='positive'?m:mate,negative=info.side==='negative'?m:mate;
-  try{verifyOperationInput(positive.geometry,'Pieza para pasador');verifyOperationInput(negative.geometry,'Pieza para alojamiento')}catch(e){return status(e.message)}
+  try{verifyOperationInput(positive.geometry,'Pieza para pasador');verifyOperationInput(negative.geometry,'Pieza para alojamiento')}catch(e){return status(e.message+' Los encastres rectangulares y la cola de milano necesitan una malla sin defectos; el pin redondo y los pasadores sueltos sí funcionan con esta pieza.')}
   const {normal,centers}=positionInfo;
-  // Rechaza profundidades que exceden el volumen disponible en la mitad receptora.
-  // Estima solo la extensión axial; no garantiza espesor local ni ausencia de cavidades.
+  const minWall=Number($('pegMinWall').value);
+  if(!Number.isFinite(minWall)||minWall<0.6||minWall>10)return status('El espesor mínimo debe estar entre 0.6 y 10 mm.');
+  let pegGeo=null,socketGeo=null,sepNormal=null;
+  status('Calculando encastres…');await new Promise(r=>requestAnimationFrame(()=>setTimeout(r,20)));
   try{
-    negative.updateWorldMatrix(true,false);
-    const p=negative.geometry.getAttribute('position'),vertex=new THREE.Vector3(),world=new THREE.Vector3();
-    const planePoint=new THREE.Vector3().fromArray(info.point);
-    let maxDepth=0;
-    for(let i=0;i<p.count;i++){
-      vertex.fromBufferAttribute(p,i);world.copy(vertex).applyMatrix4(negative.matrixWorld);
-      maxDepth=Math.max(maxDepth,-world.sub(planePoint).dot(normal));
-    }
-    assertConnectorDepthFits({depth:c.depth,clearance:c.clearance,maxDepth});
-    // Muestra local conservadora: 8 direcciones radiales a dos profundidades de cada alojamiento.
-    // Solo se calcula para mallas moderadas; si la comprobación es inviable, no ejecuta CSG.
-    const minWall=Number($('pegMinWall').value);
-    if(!Number.isFinite(minWall)||minWall<0.6||minWall>10)throw Error('El espesor mínimo debe estar entre 0.6 y 10 mm.');
-    const index=negative.geometry.getIndex(),triangleCount=index?index.count/3:p.count/3;
-    if(!Number.isInteger(triangleCount)||triangleCount>120000)throw Error('La malla supera el límite de la verificación local (120 000 triángulos). No se aplicaron encastres.');
-    const vertexA=new THREE.Vector3(),vertexB=new THREE.Vector3(),vertexC=new THREE.Vector3();
-    const tangent=new THREE.Vector3(1,0,0);
-    if(Math.abs(tangent.dot(normal))>.9)tangent.set(0,1,0);
-    tangent.addScaledVector(normal,-tangent.dot(normal)).normalize();
-    const bitangent=new THREE.Vector3().crossVectors(normal,tangent).normalize();
-    negative.updateWorldMatrix(true,false);
-    const faceWorld=[];
-    for(let i=0;i<triangleCount;i++){
-      const ia=index?index.getX(i*3):i*3,ib=index?index.getX(i*3+1):i*3+1,ic=index?index.getX(i*3+2):i*3+2;
-      const a=vertexA.fromBufferAttribute(p,ia).clone().applyMatrix4(negative.matrixWorld);
-      const b=vertexB.fromBufferAttribute(p,ib).clone().applyMatrix4(negative.matrixWorld);
-      const d=vertexC.fromBufferAttribute(p,ic).clone().applyMatrix4(negative.matrixWorld);
-      faceWorld.push([a,b,d]);
-    }
-    const socketRadius=c.diameter/2+c.clearance;
-    for(const center of centers){
-      const measured=[];
-      for(const fraction of [.45,.82]){
-        const origin=center.clone().addScaledVector(normal,-c.depth*fraction);
-        for(let step=0;step<8;step++){
-          const angle=step*Math.PI/4;
-          const dir=tangent.clone().multiplyScalar(Math.cos(angle)).addScaledVector(bitangent,Math.sin(angle));
-          const ray=new THREE.Ray(origin,dir),hit=new THREE.Vector3();let nearest=Infinity;
-          for(const [a,b,d] of faceWorld){
-            if(ray.intersectTriangle(a,b,d,false,hit)){
-              const distance=hit.distanceTo(origin);
-              if(distance>1e-5&&distance<nearest)nearest=distance;
-            }
-          }
-          measured.push(nearest);
-        }
-      }
-      assertRadialWallSamples({distances:measured,socketRadius,minimumWall:minWall});
-    }
-  }catch(e){return status('Encastres cancelados: '+e.message)}
-  let Brush,Evaluator,ADDITION,SUBTRACTION;
-  try{({Brush,Evaluator,ADDITION,SUBTRACTION}=await loadCSG())}catch(e){return status(e.message)}
-  const evaluator=new Evaluator();
-  const q=new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0),normal);
-  // El perfil trapezoidal se extruye a lo largo del eje normal al plano de corte.
-  // No garantiza un recorrido libre de ensamblaje ni la resistencia de la unión.
-  const dovetail=(w,h,depth,taper,center)=>{
-    const mesh=new Brush(dovetailGeometry(THREE,w,h,depth,taper));
-    mesh.geometry.deleteAttribute('uv');mesh.position.copy(center);mesh.quaternion.copy(q);mesh.updateMatrixWorld(true);return mesh;
-  };
-  const rectangular=(w,h,depth,center)=>{
-    const mesh=new Brush(new THREE.BoxGeometry(w,depth,h));
-    mesh.geometry.deleteAttribute('uv');mesh.position.copy(center);mesh.quaternion.copy(q);mesh.updateMatrixWorld(true);return mesh;
-  };
-  const cylindrical=(r,height,center)=>{
-    const mesh=new Brush(cylindricalGeometry(THREE,r,height));
-    mesh.geometry.deleteAttribute('uv');mesh.position.copy(center);mesh.quaternion.copy(q);mesh.updateMatrixWorld(true);return mesh;
-  };
-  function worldBrush(src){
-    src.updateWorldMatrix(true,false);
-    const g=src.geometry.clone();for(const name of Object.keys(g.attributes)){if(name!=='position'&&name!=='normal')g.deleteAttribute(name)}g.clearGroups();g.applyMatrix4(src.matrixWorld);
-    const brush=new Brush(g);brush.updateMatrixWorld(true);return brush;
-  }
-  const normalized=(input,matrix)=>{
-    const g=input.clone(),begin=Math.max(0,g.drawRange.start||0),total=g.index?g.index.count:g.attributes.position.count;
-    const count=Math.min(total-begin,Number.isFinite(g.drawRange.count)?g.drawRange.count:total);
-    if(count<=0)throw Error('La operación no produjo triángulos.');
-    const pos=[],norm=[],p=g.getAttribute('position'),n=g.getAttribute('normal'),idx=g.getIndex();
-    for(let i=begin;i<begin+count;i++){
-      const at=idx?idx.getX(i):i;pos.push(p.getX(at),p.getY(at),p.getZ(at));
-      if(n)norm.push(n.getX(at),n.getY(at),n.getZ(at));
-    }
-    const output=new THREE.BufferGeometry();output.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
-    if(norm.length===pos.length)output.setAttribute('normal',new THREE.Float32BufferAttribute(norm,3));
-    output.applyMatrix4(matrix);return output;
-  };
-  let pegGeo=null,socketGeo=null;
-  try{
-    let male=worldBrush(positive),female=worldBrush(negative);
-    for(const point of centers){
-      const pegHeight=c.depth+.8,pegCenter=point.clone().addScaledVector(normal,.4-c.depth/2);
-      const socketHeight=c.depth+c.clearance+.35,socketCenter=point.clone().addScaledVector(normal,.15-socketHeight/2);
-      const maleTool=c.shape==='dovetail'?dovetail(c.width,c.height,pegHeight,c.taper,pegCenter):c.shape==='rectangular'?rectangular(c.width,c.height,pegHeight,pegCenter):cylindrical(c.diameter/2,pegHeight,pegCenter);
-      const femaleTool=c.shape==='dovetail'?dovetail(c.width+2*c.clearance,c.height+2*c.clearance,socketHeight,c.taper,socketCenter):c.shape==='rectangular'?rectangular(c.width+2*c.clearance,c.height+2*c.clearance,socketHeight,socketCenter):cylindrical(c.diameter/2+c.clearance,socketHeight,socketCenter);
-      male=evaluator.evaluate(male,maleTool,ADDITION);
-      female=evaluator.evaluate(female,femaleTool,SUBTRACTION);
-      if(!male.geometry?.attributes?.position?.count||!female.geometry?.attributes?.position?.count)throw Error('Operación booleana vacía.');
-      // El evaluador puede devolver resultados con drawRange: reconstruimos las mallas sin vértices sobrantes.
-      const toBrush=mesh=>{const geom=normalized(mesh.geometry,new THREE.Matrix4());const b=new Brush(geom);b.updateMatrixWorld(true);return b};
-      male=toBrush(male);female=toBrush(female);
-    }
-    positive.updateWorldMatrix(true,false);negative.updateWorldMatrix(true,false);
-    pegGeo=normalized(male.geometry,positive.matrixWorld.clone().invert());socketGeo=normalized(female.geometry,negative.matrixWorld.clone().invert());
-    pegGeo.computeVertexNormals();socketGeo.computeVertexNormals();
+    // Pasador / riel: sale de la cara del corte de la mitad positiva hacia la negativa.
+    const M=connectorShapesFor(info,m,positive,centers,c,'male'),F=connectorShapesFor(info,m,negative,centers,c,'female');
+    const male=aplicarEncastreExacto(worldSoup(positive),{plano:M.plane,huellas:M.shapes,profundidad:c.depth,sentido:-1,tipo:'saliente',margen:0.6,fuenteNueva:mainFaceIndex(positive.geometry)});
+    // Alojamiento / canal: hueco con holgura en la mitad negativa, un poco más profundo que el pasador.
+    const female=aplicarEncastreExacto(worldSoup(negative),{plano:F.plane,huellas:F.shapes,profundidad:c.depth+c.clearance+0.2,sentido:-1,tipo:'hueco',muro:minWall,margen:minWall,fuenteNueva:mainFaceIndex(negative.geometry)});
+    sepNormal=M.normal.clone();
+    pegGeo=exactToGeometry(male,positive,faceMaterials(positive.geometry));
+    socketGeo=exactToGeometry(female,negative,faceMaterials(negative.geometry));
     requireClosedResult(pegGeo,'Pieza con pasador');requireClosedResult(socketGeo,'Pieza con alojamiento');
-    // Etapa 27: comparar volumen real de las dos piezas antes/después del CSG.
-    // Se ejecuta antes de reemplazar cualquier objeto del proyecto.
-    const volumeCheck=c.shape==='dovetail'?assertDovetailVolumeChange({
-      maleBefore:Math.abs(signedMeshVolume(positive.geometry)),maleAfter:Math.abs(signedMeshVolume(pegGeo)),
-      femaleBefore:Math.abs(signedMeshVolume(negative.geometry)),femaleAfter:Math.abs(signedMeshVolume(socketGeo)),
-      width:c.width,height:c.height,depth:c.depth,clearance:c.clearance,taper:c.taper
-    }):c.shape==='rectangular'?assertRectangularVolumeChange({
-      maleBefore:Math.abs(signedMeshVolume(positive.geometry)),maleAfter:Math.abs(signedMeshVolume(pegGeo)),
-      femaleBefore:Math.abs(signedMeshVolume(negative.geometry)),femaleAfter:Math.abs(signedMeshVolume(socketGeo)),
-      width:c.width,height:c.height,depth:c.depth,clearance:c.clearance
-    }):assertConnectorBooleanVolumeChanges({
-      maleBefore:Math.abs(signedMeshVolume(positive.geometry)),
-      maleAfter:Math.abs(signedMeshVolume(pegGeo)),
-      femaleBefore:Math.abs(signedMeshVolume(negative.geometry)),
-      femaleAfter:Math.abs(signedMeshVolume(socketGeo)),
-      pegRadius:c.diameter/2,socketRadius:c.diameter/2+c.clearance,
-      depth:c.depth,clearance:c.clearance
-    });
-    pegGeo.userData={...(pegGeo.userData||{}),connectorVolumeCheck:volumeCheck};
-    // Etapa 15: medir el radio REAL de las superficies después del cálculo CSG.
-    // Se verifican dos secciones internas por conector y ocho direcciones por sección.
-    // Rayos desde el eje de cada encastre hacia fuera, en coordenadas mundiales.
-    const pegWorld=new THREE.Mesh(pegGeo,new THREE.MeshBasicMaterial({side:THREE.DoubleSide}));
-    const socketWorld=new THREE.Mesh(socketGeo,new THREE.MeshBasicMaterial({side:THREE.DoubleSide}));
-    pegWorld.applyMatrix4(positive.matrixWorld);socketWorld.applyMatrix4(negative.matrixWorld);
-    pegWorld.updateMatrixWorld(true);socketWorld.updateMatrixWorld(true);
-    const raycaster=new THREE.Raycaster(),rayDir=new THREE.Vector3();
-    const measure=(target,point,direction)=>{
-      raycaster.set(point,direction);raycaster.near=1e-4;raycaster.far=Math.max(c.diameter*3+10,60);
-      const hits=raycaster.intersectObject(target,false);
-      return hits.length?hits[0].distance:Infinity;
-    };
-    const pegSamples=[],socketSamples=[];
-    const radialTolerance=Math.max(0.15,c.diameter*0.025);
-    const axes=pegAxes(info);
-    for(const center of centers){
-      for(const fraction of [.3,.7]){
-        const rayOrigin=center.clone().addScaledVector(normal,-c.depth*fraction);
-        for(let step=0;step<8;step++){
-          const angle=step*Math.PI/4;
-          rayDir.copy(axes.tangent).multiplyScalar(Math.cos(angle)).addScaledVector(axes.bitangent,Math.sin(angle)).normalize();
-          pegSamples.push(measure(pegWorld,rayOrigin,rayDir));
-          socketSamples.push(measure(socketWorld,rayOrigin,rayDir));
-        }
-      }
-    }
-    const post=c.shape!=='circular'?{experimental:true,measurement:'No se certifican medidas post-CSG del perfil; solo topología y cambio de volumen'}:assertConnectorPostBooleanMeasurements({pegDistances:pegSamples,socketDistances:socketSamples,pegRadius:c.diameter/2,socketRadius:c.diameter/2+c.clearance,tolerance:radialTolerance});
-    pegGeo.userData={...(pegGeo.userData||{}),connectorMeasurement:{...post,experimental:true}};
-  }catch(e){pegGeo?.dispose();socketGeo?.dispose();console.error(e);return status('Encastres cancelados: '+e.message)}
-  save();disablePegTouch();pegCustomOffsets=null;clearPegMarkers();transform.detach();
+    pegGeo.userData={connectorExact:{added:male.cambioVolumen,removed:-female.cambioVolumen}};
+  }catch(e){pegGeo?.dispose();socketGeo?.dispose();console.error(e);clearPegMarkers();return status('Encastres cancelados: '+e.message+' (se quitó la vista previa; corrige y vuelve a pulsar «Ver ubicación de pasadores»).')}
+  save();disablePegTouch();pegCustomOffsets=null;pegAutoInfo=null;clearPegMarkers();(transform.detach(),gizmoTarget=null);
   const replace=(old,geometry)=>{
-    const replacement=new THREE.Mesh(geometry,old.material.clone());replacement.name=old.name;
+    const replacement=new THREE.Mesh(geometry,Array.isArray(old.material)?old.material.map(x=>x.clone()):old.material.clone());replacement.name=old.name;
     replacement.position.copy(old.position);replacement.quaternion.copy(old.quaternion);replacement.scale.copy(old.scale);
     replacement.userData=structuredClone(old.userData);replacement.userData.bisturiCut.connectorMade=true;
     old.parent.add(replacement);old.removeFromParent();const index=meshes.indexOf(old);meshes[index]=replacement;
@@ -1055,15 +1097,78 @@ $('pegApplyBtn').onclick=async()=>{
   newPositive.userData.bisturiCut.mate=newNegative.uuid;newNegative.userData.bisturiCut.mate=newPositive.uuid;
   newPositive.userData.bisturiCut.connectorCount=centers.length;newNegative.userData.bisturiCut.connectorCount=centers.length;
   selected=newPositive;dirty=true;refreshBeds();updateList();updateStats();fit();
+const gap=c.depth+(c.shape==='dovetail'?c.height+c.clearance:0)+10;separateForReview(newPositive,sepNormal,gap);updateList();fit();
+  const sep=` Las dos mitades se separaron ${gap.toFixed(0)} mm para que veas los encastres; Atrás las vuelve a juntar.`;
   if(c.shape==='dovetail'){
-    status(`${centers.length} encastre(s) de cola de milano experimentales: ancho ${c.width.toFixed(2)} mm, alto ${c.height.toFixed(2)} mm y estrechamiento lateral ${c.taper.toFixed(2)} mm. Comprueba el sentido de ensamblaje y la geometría final en el laminador.`);
+    status(`${centers.length} cola(s) de milano deslizante(s): riel de ${c.height.toFixed(1)} mm de largo, ${(c.width-2*c.taper).toFixed(1)} → ${c.width.toFixed(1)} mm de ancho y ${c.depth.toFixed(1)} mm de alto; canal con ${c.clearance.toFixed(2)} mm de holgura y entrada. Monta apoyando el riel en la entrada y deslizándolo hasta el tope.`+sep);
   }else if(c.shape==='rectangular'){
-    status(`${centers.length} encastre(s) rectangular(es) experimentales: ${c.width.toFixed(2)} × ${c.height.toFixed(2)} mm; alojamiento ${(c.width+2*c.clearance).toFixed(2)} × ${(c.height+2*c.clearance).toFixed(2)} mm; profundidad ${c.depth.toFixed(2)} mm. Validar en laminador; dimensiones finales no certificadas.`);
+    status(`${centers.length} encastre(s) rectangular(es): ${c.width.toFixed(2)} × ${c.height.toFixed(2)} mm; alojamiento ${(c.width+2*c.clearance).toFixed(2)} × ${(c.height+2*c.clearance).toFixed(2)} mm; profundidad ${c.depth.toFixed(2)} mm.`+sep);
   }else{
     const dims=inspectConnectorSpec(c);
-    status(`${centers.length} encastre(s) experimental(es): pasador Ø${dims.pegDiameter.toFixed(2)} mm; alojamiento Ø${dims.socketDiameter.toFixed(2)} mm; holgura radial ${c.clearance.toFixed(2)} mm. Comprueba medidas y ajuste en el laminador antes de imprimir.`);
+    status(`${centers.length} pasador(es): Ø${dims.pegDiameter.toFixed(2)} mm; alojamiento Ø${dims.socketDiameter.toFixed(2)} mm; holgura radial ${c.clearance.toFixed(2)} mm.`+sep);
   }
 };
+
+// Encastres redondos como en la primera versión: pin pegado (macho-hembra) o pasadores sueltos.
+// La comprobación es relativa: el encastre no puede abrir bordes nuevos en la malla, pero no
+// rechaza piezas que ya traían pequeños defectos de origen (como hacía la primera versión).
+// Cuenta bordes abiertos de verdad (topología): las astillas finísimas cierran la malla igual
+// y no se cuentan como agujeros, porque el laminador las trata bien.
+function openEdgeCount(geometry){const q=analyzeMeshGeometry(geometry,{tolerance:1e-7,maxTriangles:4000000,degenerateEdges:true});return q.level==='unknown'?null:q.boundary+q.nonManifold}
+async function applyV2fConnectors(pair,c){
+  status(c.shape==='alignment'?'Calculando pasadores…':'Calculando encastres…');await new Promise(r=>requestAnimationFrame(()=>setTimeout(r,20)));
+  let run,geos=[],pinGeos=[];
+  try{
+    // Si una zona de la tapa resultara defectuosa al rehacerla, se prueba otra zona sana.
+    const evitar=[[],[]];let aviso='';
+    for(let intento=0;;intento++){
+      geos.forEach(g=>g?.dispose());geos=[];
+      run=runV2f(pair,c,{evitar});
+      const {r,M,m,mate}=run,inv=M.clone().invert();let malo=-1,extra=0;
+      r.piezas.forEach((q,i)=>{const mesh=i?mate:m;geos.push(q.cambiada?geometryFromSoup(q.sopa,q.col,inv):null);
+        if(q.cambiada&&malo<0){const before=openEdgeCount(mesh.geometry),after=openEdgeCount(geos[i]);if(before!==null&&after!==null&&after>before){malo=i;extra=after-before;aviso=`el encastre abriría ${extra} borde(s) en «${mesh.name}».`}}});
+      if(malo<0)break;
+      if(intento>=4)throw Error(aviso+' La cara del corte tiene defectos en esa zona: mueve el plano de corte unos milímetros o mueve el encastre.');
+      for(const u of r.ubicaciones)evitar[malo].push(u.islas[malo]);
+    }
+    root.updateWorldMatrix(true,false);const toRoot=root.matrixWorld.clone().invert();
+    for(const pin of run.r.pasadores){const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(pin.sopa,3));g.applyMatrix4(toRoot);g.computeVertexNormals();pinGeos.push({g,largo:pin.largo,d:pin.d});}
+  }catch(e){geos.forEach(g=>g?.dispose());pinGeos.forEach(p=>p.g.dispose());console.error(e);clearPegMarkers();return status('Encastres cancelados: '+e.message+' (se quitó la vista previa).')}
+  const {r,m,mate}=run;
+  save();disablePegTouch();pegCustomOffsets=null;pegAutoInfo=null;clearPegMarkers();(transform.detach(),gizmoTarget=null);
+  const replace=(old,geometry)=>{
+    if(!geometry){old.userData.bisturiCut.connectorMade=true;return old}
+    const replacement=new THREE.Mesh(geometry,Array.isArray(old.material)?old.material.map(x=>x.clone()):old.material.clone());replacement.name=old.name;
+    replacement.position.copy(old.position);replacement.quaternion.copy(old.quaternion);replacement.scale.copy(old.scale);
+    replacement.userData=structuredClone(old.userData);replacement.userData.bisturiCut.connectorMade=true;
+    old.parent.add(replacement);old.removeFromParent();meshes[meshes.indexOf(old)]=replacement;
+    basePositions.set(replacement.uuid,replacement.position.clone());originalMaterials.set(replacement.uuid,replacement.material);
+    for(const bed of beds){const i=bed.items.indexOf(old.uuid);if(i!==-1){bed.items[i]=replacement.uuid;bed.placements[replacement.uuid]=bed.placements[old.uuid];delete bed.placements[old.uuid]}}
+    return replacement;
+  };
+  const nm=replace(m,geos[0]),nmate=replace(mate,geos[1]);
+  nm.userData.bisturiCut.mate=nmate.uuid;nmate.userData.bisturiCut.mate=nm.uuid;
+  nm.userData.bisturiCut.connectorCount=r.ubicaciones.length;nmate.userData.bisturiCut.connectorCount=r.ubicaciones.length;
+  pinGeos.forEach(({g,largo,d},i)=>{
+    const piece=new THREE.Mesh(g,new THREE.MeshStandardMaterial({color:0xf9c65f,roughness:.55}));
+    piece.name=`Pasador ${i+1} (Ø${d.toFixed(1)} × ${largo.toFixed(1)} mm)`;
+    piece.userData.bisturiAlignmentPin={diameter:d,length:largo,clearance:c.clearance};
+    root.add(piece);meshes.push(piece);basePositions.set(piece.uuid,piece.position.clone());originalMaterials.set(piece.uuid,piece.material);
+  });
+  selected=nm;dirty=true;refreshBeds();updateList();updateStats();fit();
+  // Separa la mitad positiva a lo largo de la normal del corte para que se vean pines y agujeros.
+  const positive=nm.userData.bisturiCut.side==='positive'?nm:nmate,axes=pegAxes(positive.userData.bisturiCut,positive);
+  const deepest=Math.max(...r.ubicaciones.map(u=>Math.max(...u.profundidad))),gap=deepest+10;
+  separateForReview(positive,axes.normal,gap);updateList();fit();
+  const depths=[...new Set(r.ubicaciones.map(u=>(c.shape==='alignment'?u.profundidad[0]+u.profundidad[1]-0.6:u.profundidad[1]).toFixed(1)))].join(', ');
+  const moved=r.ubicaciones.filter(u=>u.movido>0.05).length,missing=c.count-r.ubicaciones.length;
+  let t=c.shape==='alignment'
+    ?`${r.ubicaciones.length} pasador(es) suelto(s) de Ø${c.diameter.toFixed(1)} mm (largo ${depths} mm) colocados en sus agujeros; agujeros de Ø${(c.diameter+2*c.clearance).toFixed(2)} mm en las dos mitades. Asígnalos a una cama para imprimirlos.`
+    :`${r.ubicaciones.length} encastre(s) macho-hembra: pin de Ø${c.diameter.toFixed(1)} mm y ${depths} mm de alto; el agujero (Ø${(c.diameter+2*c.clearance).toFixed(2)} mm) va en la mitad más gruesa.`;
+  if(moved)t+=` ${moved} se movió al punto válido más cercano.`;
+  if(missing>0)t+=` No cupieron ${missing} con esa medida y pared.`;
+  status(t+` La mitad positiva se separó ${gap.toFixed(0)} mm para que veas los encastres; Atrás la vuelve a juntar.`);
+}
 
 // Pasadores de alineación desmontables: dos alojamientos frente a frente y piezas STL independientes.
 // Experimentales: revisar dimensión real, espesor, sentido de montaje y tolerancia en un laminador.
@@ -1088,63 +1193,29 @@ async function applyLooseAlignmentPins(pair,c,positionInfo){
       }
       assertConnectorDepthFits({depth:depthPerSide,clearance:c.clearance,maxDepth});
     }
-  }catch(e){return status('Pasadores cancelados: '+e.message)}
-  let Brush,Evaluator,SUBTRACTION;
-  try{({Brush,Evaluator,SUBTRACTION}=await loadCSG())}catch(e){return status(e.message)}
+  }catch(e){clearPegMarkers();return status('Pasadores cancelados: '+e.message+' (se quitó la vista previa).')}
   const q=new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0),normal);
-  const evaluator=new Evaluator();
-  const worldBrush=piece=>{
-    piece.updateWorldMatrix(true,false);
-    const g=piece.geometry.clone();
-    for(const name of Object.keys(g.attributes))if(name!=='position'&&name!=='normal')g.deleteAttribute(name);
-    g.clearGroups();g.applyMatrix4(piece.matrixWorld);
-    const b=new Brush(g);b.updateMatrixWorld(true);return b;
-  };
-  const tool=(r,h,point)=>{
-    const b=new Brush(cylindricalGeometry(THREE,r,h));
-    b.geometry.deleteAttribute('uv');b.position.copy(point);b.quaternion.copy(q);b.updateMatrixWorld(true);return b;
-  };
-  const normalized=(input,matrix)=>{
-    const g=input.clone(),p=g.getAttribute('position'),idx=g.getIndex();
-    if(!p)throw Error('La operación produjo una malla vacía.');
-    const begin=Math.max(0,g.drawRange.start||0),total=idx?idx.count:p.count;
-    const count=Math.min(total-begin,Number.isFinite(g.drawRange.count)?g.drawRange.count:total);
-    if(!Number.isInteger(count)||count<=0||count%3)throw Error('La operación produjo triángulos incompletos.');
-    const values=[];for(let i=begin;i<begin+count;i++){
-      const at=idx?idx.getX(i):i;values.push(p.getX(at),p.getY(at),p.getZ(at));
-    }
-    const out=new THREE.BufferGeometry();out.setAttribute('position',new THREE.Float32BufferAttribute(values,3));
-    out.applyMatrix4(matrix);out.computeVertexNormals();return out;
-  };
-  let aGeo,bGeo;
+  const minWall=Number($('pegMinWall').value);
+  if(!Number.isFinite(minWall)||minWall<0.6||minWall>10)return status('El espesor mínimo debe estar entre 0.6 y 10 mm.');
+  let aGeo,bGeo,alignNormal=null,pinCenters=null;
   const pinSpecs=[];
+  status('Calculando pasadores…');await new Promise(r=>requestAnimationFrame(()=>setTimeout(r,20)));
   try{
-    let a=worldBrush(positive),b=worldBrush(negative);
-    // Entrada de 0.15 mm más allá del plano central para atravesar la tapa y abrir el alojamiento.
-    const socketDepth=depthPerSide+c.clearance+0.3;
-    for(const center of centers){
-      const plusCenter=center.clone().addScaledVector(normal,(socketDepth/2)-0.15);
-      const minusCenter=center.clone().addScaledVector(normal,-(socketDepth/2)+0.15);
-      a=evaluator.evaluate(a,tool(c.diameter/2+c.clearance,socketDepth,plusCenter),SUBTRACTION);
-      b=evaluator.evaluate(b,tool(c.diameter/2+c.clearance,socketDepth,minusCenter),SUBTRACTION);
-      if(!a.geometry?.attributes?.position?.count||!b.geometry?.attributes?.position?.count)throw Error('Resultado CSG vacío.');
-      a=new Brush(normalized(a.geometry,new THREE.Matrix4()));a.updateMatrixWorld(true);
-      b=new Brush(normalized(b.geometry,new THREE.Matrix4()));b.updateMatrixWorld(true);
-      pinSpecs.push({center:center.clone()});
-    }
-    positive.updateWorldMatrix(true,false);negative.updateWorldMatrix(true,false);
-    aGeo=normalized(a.geometry,positive.matrixWorld.clone().invert());
-    bGeo=normalized(b.geometry,negative.matrixWorld.clone().invert());
+    const socketDepth=depthPerSide+c.clearance+0.15,cc={...c,shape:'circular'};
+    const PA=connectorShapesFor(info,m,positive,centers,cc,'female'),PB=connectorShapesFor(info,m,negative,centers,cc,'female');
+    // Un alojamiento en cada mitad, frente a frente; el pasador suelto entra en los dos.
+    const A=aplicarEncastreExacto(worldSoup(positive),{plano:PA.plane,huellas:PA.shapes,profundidad:socketDepth,sentido:1,tipo:'hueco',muro:minWall,margen:minWall,fuenteNueva:mainFaceIndex(positive.geometry)});
+    const B=aplicarEncastreExacto(worldSoup(negative),{plano:PB.plane,huellas:PB.shapes,profundidad:socketDepth,sentido:-1,tipo:'hueco',muro:minWall,margen:minWall,fuenteNueva:mainFaceIndex(negative.geometry)});
+    alignNormal=PA.normal.clone();pinCenters=PB.centers;
+    aGeo=exactToGeometry(A,positive,faceMaterials(positive.geometry));
+    bGeo=exactToGeometry(B,negative,faceMaterials(negative.geometry));
     requireClosedResult(aGeo,'Mitad A con alojamiento');requireClosedResult(bGeo,'Mitad B con alojamiento');
-    for(const [oldMesh,newGeo] of [[positive,aGeo],[negative,bGeo]]){
-      const before=Math.abs(signedMeshVolume(oldMesh.geometry)),after=Math.abs(signedMeshVolume(newGeo));
-      if(!(before>0&&after>0&&after<before))throw Error('No se retiró material correctamente del alojamiento.');
-    }
-  }catch(e){aGeo?.dispose();bGeo?.dispose();console.error(e);return status('Pasadores cancelados: '+e.message)}
+    for(const center of pinCenters)pinSpecs.push({center:center.clone()});
+  }catch(e){aGeo?.dispose();bGeo?.dispose();console.error(e);clearPegMarkers();return status('Pasadores cancelados: '+e.message+' (se quitó la vista previa).')}
   // Aplicar todo como una sola acción reversible, solo después de validar ambos alojamientos.
-  save();disablePegTouch();pegCustomOffsets=null;clearPegMarkers();transform.detach();
+  save();disablePegTouch();pegCustomOffsets=null;pegAutoInfo=null;clearPegMarkers();(transform.detach(),gizmoTarget=null);
   const replace=(old,geometry)=>{
-    const replacement=new THREE.Mesh(geometry,old.material.clone());replacement.name=old.name;
+    const replacement=new THREE.Mesh(geometry,Array.isArray(old.material)?old.material.map(x=>x.clone()):old.material.clone());replacement.name=old.name;
     replacement.position.copy(old.position);replacement.quaternion.copy(old.quaternion);replacement.scale.copy(old.scale);
     replacement.userData=structuredClone(old.userData);replacement.userData.bisturiCut.connectorMade=true;
     old.parent.add(replacement);old.removeFromParent();meshes[meshes.indexOf(old)]=replacement;
@@ -1160,16 +1231,17 @@ async function applyLooseAlignmentPins(pair,c,positionInfo){
   root.updateWorldMatrix(true,false);
   const inverseRoot=root.matrixWorld.clone().invert();
   pinSpecs.forEach(({center},i)=>{
-    const geometry=new THREE.CylinderGeometry(c.diameter/2,c.diameter/2,c.depth,40,1,false);
-    const matrix=new THREE.Matrix4().compose(center,q,new THREE.Vector3(1,1,1));
-    geometry.applyMatrix4(matrix).applyMatrix4(inverseRoot);geometry.computeVertexNormals();
+    const pin=prismaSuelto(connectorFootprint(center,alignNormal,{...c,shape:'circular'},0),alignNormal.toArray(),-c.depth/2,c.depth/2);
+    const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(pin.pos,3));geometry.setIndex(new THREE.BufferAttribute(pin.tri,1));
+    geometry.applyMatrix4(inverseRoot);geometry.computeVertexNormals();
     const piece=new THREE.Mesh(geometry,new THREE.MeshStandardMaterial({color:0xf9c65f,roughness:.55}));
     piece.name=`Pasador alineación ${i+1}`;
     piece.userData.bisturiAlignmentPin={diameter:c.diameter,length:c.depth,clearance:c.clearance};
     root.add(piece);meshes.push(piece);basePositions.set(piece.uuid,piece.position.clone());originalMaterials.set(piece.uuid,piece.material);
   });
   selected=newPositive;dirty=true;refreshBeds();updateList();updateStats();fit();
-  status(`${centers.length} pasador(es) desmontables y dos alojamientos por pasador. Asigna las piezas independientes a una cama; verifica ajuste y espesor antes de imprimir.`);
+  const gap=depthPerSide+10;separateForReview(newPositive,alignNormal,gap);updateList();fit();
+  status(`${centers.length} pasador(es) desmontables (Ø${c.diameter.toFixed(2)} × ${c.depth.toFixed(1)} mm) y un alojamiento en cada mitad (Ø${(c.diameter+2*c.clearance).toFixed(2)} mm). La mitad positiva se separó ${gap.toFixed(0)} mm para que veas los alojamientos; Atrás la vuelve a juntar. Asigna los pasadores a una cama para imprimirlos.`);
 }
 
 $('cutOrientation').onchange=()=>{$('cutAngles').hidden=$('cutOrientation').value!=='inclinado';refreshCutGuide()};
@@ -1201,7 +1273,7 @@ function diagnoseAfterImport(){
   let flagged=0;
   for(const mesh of meshes){
     let classification;
-    try{classification=classifyImportedMesh(analyzeMeshGeometry(mesh.geometry,{tolerance:1e-6,maxTriangles:250000}))}
+    try{classification=classifyImportedMesh(analyzeMeshGeometry(mesh.geometry,{tolerance:1e-6,maxTriangles:4000000}))}
     catch(err){classification={status:'unknown',description:'No se pudo analizar: '+err.message,repairCandidate:false}}
     if(classification.status==='ok')continue;
     flagged++;
@@ -1491,7 +1563,7 @@ function fitBed(){
   const center=new THREE.Vector3((minX+maxX)/2,0,maxZ/2);const size=Math.max(maxX-minX,maxZ,maxH);const d=size*1.7;
   orbit.target.copy(center);camera.position.copy(center).add(new THREE.Vector3(d*.56,d*.85,d*.75));camera.near=.01;camera.far=d*35;camera.updateProjectionMatrix();orbit.update();
 }
-function enterBed(showAll=false){if(!modelLoaded)return status('Importa un modelo primero.');bedMode=true;allBedsView=showAll;root.visible=false;grid.visible=false;bedStage.visible=true;transform.detach();$('viewBed3D').classList.add('active');$('viewBed3D').textContent='Volver al modelo';updateBedStage();fitBed();status(showAll?'Vista general: todas las camas visibles. Selecciona o arrastra una pieza; verifica límites tras moverla.':'Cama 3D: arrastra una pieza para colocarla.')}
+function enterBed(showAll=false){if(!modelLoaded)return status('Importa un modelo primero.');bedMode=true;allBedsView=showAll;root.visible=false;grid.visible=false;bedStage.visible=true;(transform.detach(),gizmoTarget=null);$('viewBed3D').classList.add('active');$('viewBed3D').textContent='Volver al modelo';updateBedStage();fitBed();status(showAll?'Vista general: todas las camas visibles. Selecciona o arrastra una pieza; verifica límites tras moverla.':'Cama 3D: arrastra una pieza para colocarla.')}
 function leaveBed(){if(!bedMode)return;if(dragBed)restoreDragPlacement(beds,dragBed);bedMode=false;allBedsView=false;dragBed=null;orbit.enabled=true;bedStage.clear();bedStage.visible=false;root.visible=true;grid.visible=true;$('viewBed3D').classList.remove('active');$('viewBed3D').textContent='Ver cama 3D';$('viewAllBeds').classList.remove('active');$('showAllBedsPanel').classList.remove('active')}
 function bedPointer(e){const r=renderer.domElement.getBoundingClientRect();pointer.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(pointer,camera);const out=new THREE.Vector3();return ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0,1,0),0),out)?{x:out.x,y:out.z}:null}
 function syncPlacementFields(){const b=getBed();const p=b&&selected&&b.placements[selected.uuid];for(const [key,id] of [['x','placeX'],['y','placeY'],['rot','placeRot']]){$(id).disabled=!p;if(p)$(id).value=Number(p[key]||0).toFixed(key==='rot'?0:1)}}
@@ -1535,7 +1607,7 @@ $('exportPlacedBed').onclick=()=>{
 refreshBeds();
 
 $('mobileShowCutResult').onclick=()=>{if($('mobileShowCutResult').disabled)return;$('explodeBtn').click();};
-function resize(){const w=viewport.clientWidth,h=viewport.clientHeight;if(w&&h){camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h,false)}}new ResizeObserver(resize).observe(viewport);resize();renderer.setAnimationLoop(()=>{orbit.update();renderer.render(scene,camera)});
+function resize(){const w=viewport.clientWidth,h=viewport.clientHeight;if(w&&h){camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h,false)}}new ResizeObserver(resize).observe(viewport);resize();renderer.setAnimationLoop(()=>{orbit.update();if(gizmoTarget&&!transform.dragging){if(!meshes.includes(gizmoTarget)||!gizmoTarget.parent)(transform.detach(),gizmoTarget=null);else syncGizmoPivot();}renderer.render(scene,camera)});
 
 // Interfaz de corte móvil: usa el mismo motor de corte del editor de escritorio.
 (function setupMobileCutUI(){
@@ -1590,7 +1662,7 @@ const curvedPanel=setupCurvedPanel(THREE,{
   if(bedMode||explode||xray)throw Error('Regresa a la vista ensamblada, sin rayos X, para calcular el corte.');
   if(!selected||!meshes.includes(selected))throw Error('Selecciona la pieza que deseas cortar.');
   if(!selected.visible)throw Error('Muestra la pieza antes de cortarla.');
-  if(surfacePreview)clearSurfacePreview();transform.detach();
+  if(surfacePreview)clearSurfacePreview();(transform.detach(),gizmoTarget=null);
   selected.updateWorldMatrix(true,false);
   return {source:selected,geometry:selected.geometry,parent:selected.parent,matrix:selected.matrixWorld.elements.slice(),revision:undo.length};
  },
@@ -1599,7 +1671,7 @@ const curvedPanel=setupCurvedPanel(THREE,{
   return meshes.includes(token.source)&&token.source.geometry===token.geometry&&token.source.parent===token.parent&&token.matrix.every((x,i)=>Math.abs(x-token.source.matrixWorld.elements[i])<1e-12)&&!bedMode&&!explode&&!xray;
  },
  commit:(token,geometries,result)=>{
-  const source=token.source;save();transform.detach();clearSurfaceOverlays();
+  const source=token.source;save();(transform.detach(),gizmoTarget=null);clearSurfaceOverlays();
   const pieces=geometries.map((geometry,i)=>{
    const part=new THREE.Mesh(geometry,new THREE.MeshStandardMaterial({color:i?0xefb272:0x5ba8ec,roughness:.65,side:THREE.DoubleSide}));
    part.name=source.name+(result.report?.method==='exacto-v2f'?(i?' — resto':' — región'):' — curva '+(i?'B':'A'));part.position.copy(source.position);part.quaternion.copy(source.quaternion);part.scale.copy(source.scale);part.visible=source.visible;
@@ -1623,12 +1695,12 @@ const nucleoPanel=setupNucleoPanel(THREE,{
   if(!selected||!meshes.includes(selected))throw Error('Selecciona primero una pieza.');
   if(!selected.visible)throw Error('Muestra la pieza antes de modificarla.');
   if(selected.userData?.locked)throw Error('Desbloquea la pieza para modificarla.');
-  if(surfacePreview)clearSurfacePreview();transform.detach();selected.updateWorldMatrix(true,false);
+  if(surfacePreview)clearSurfacePreview();(transform.detach(),gizmoTarget=null);selected.updateWorldMatrix(true,false);
   return {source:selected,geometry:selected.geometry,parent:selected.parent,matrix:selected.matrixWorld.elements.slice()};
  },
  isCurrent:token=>{token.source.updateWorldMatrix(true,false);return meshes.includes(token.source)&&token.source.geometry===token.geometry&&token.source.parent===token.parent&&token.matrix.every((x,i)=>Math.abs(x-token.source.matrixWorld.elements[i])<1e-9)&&!bedMode&&!explode&&!xray;},
  commit:(token,pieces,op)=>{
-  const source=token.source;save();transform.detach();clearSurfaceOverlays();
+  const source=token.source;save();(transform.detach(),gizmoTarget=null);clearSurfaceOverlays();
   const base=Array.isArray(source.material)?source.material[0]:source.material,palette=[0x5ba8ec,0xefb272,0x6fcf97,0xc792ea,0xf2c94c,0xeb5757,0x56ccf2,0xbb6bd9];
   const label={partes:'parte',reparar:'cerrada',cama:'cama',color:'color'}[op]||'pieza';
   const created=pieces.map((p,i)=>{
@@ -1643,5 +1715,51 @@ const nucleoPanel=setupNucleoPanel(THREE,{
  }
 });
 
+
+
+
+// API para la interfaz (layout.js): vistas, herramientas de transformación y unir piezas.
+function setView(dir){
+ if(bedMode)leaveBed();
+ root.updateMatrixWorld(true);const box=new THREE.Box3().setFromObject(root);
+ const c=box.isEmpty()?new THREE.Vector3():box.getCenter(new THREE.Vector3()),d=(box.isEmpty()?200:box.getSize(new THREE.Vector3()).length())*1.25;
+ const dirs={frontal:[0,0,1],trasera:[0,0,-1],izquierda:[-1,0,0],derecha:[1,0,0],superior:[0,1,0],inferior:[0,-1,0],libre:[.55,.45,.7]};
+ const v=new THREE.Vector3(...(dirs[dir]||dirs.libre)).normalize();
+ camera.up.set(0,1,0);if(dir==='superior')camera.up.set(0,0,-1);if(dir==='inferior')camera.up.set(0,0,1);
+ orbit.target.copy(c);camera.position.copy(c).addScaledVector(v,d);camera.lookAt(c);camera.updateProjectionMatrix();orbit.update();
+}
+function mergeVisiblePieces(){
+ const list=meshes.filter(m=>m.visible);
+ if(list.length<2){status('Para unir hacen falta al menos dos piezas visibles. Oculta con el ojo las que no quieras unir.');return;}
+ if(bedMode||explode)throw Error('Regresa a la vista ensamblada antes de unir piezas.');
+ save();(transform.detach(),gizmoTarget=null);clearSurfaceOverlays();root.updateMatrixWorld(true);
+ const base=list[0],inv=base.matrixWorld.clone().invert(),parts=[],materials=[];let total=0;
+ const v=new THREE.Vector3();
+ list.forEach((m,k)=>{const g=m.geometry,p=g.getAttribute('position'),idx=g.index,n=idx?idx.count:p.count,arr=new Float32Array(n*3),mat=m.matrixWorld.clone().premultiply(inv);
+  for(let i=0;i<n;i++){v.fromBufferAttribute(p,idx?idx.getX(i):i).applyMatrix4(mat);arr[3*i]=v.x;arr[3*i+1]=v.y;arr[3*i+2]=v.z;}
+  parts.push(arr);total+=n;const mm=Array.isArray(m.material)?m.material[0]:m.material;materials.push(mm);});
+ const pos=new Float32Array(total*3);let o=0;const geo=new THREE.BufferGeometry();
+ parts.forEach((a,k)=>{pos.set(a,o*3);geo.addGroup(o,a.length/3,k);o+=a.length/3;});
+ geo.setAttribute('position',new THREE.BufferAttribute(pos,3));geo.computeVertexNormals();geo.computeBoundingBox();
+ const merged=new THREE.Mesh(geo,materials);merged.name=base.name+' (unida)';merged.position.copy(base.position);merged.quaternion.copy(base.quaternion);merged.scale.copy(base.scale);
+ base.parent.add(merged);basePositions.set(merged.uuid,merged.position.clone());originalMaterials.set(merged.uuid,merged.material);
+ const first=meshes.indexOf(base);meshes.splice(first,1,merged);
+ for(const m of list.slice(1)){meshes.splice(meshes.indexOf(m),1);m.removeFromParent();}
+ base.removeFromParent();
+ const gone=new Set(list.map(m=>m.uuid));for(const bed of beds){bed.items=bed.items.filter(id=>!gone.has(id));for(const id of gone)delete bed.placements[id];}
+ selected=merged;dirty=true;cutPair=null;syncResultButtons();refreshBeds();updateList();updateStats();
+ status(`${list.length} piezas unidas en una sola malla (sin operación booleana: las zonas que se solapan quedan superpuestas). Usa Atrás para deshacer.`);
+}
+window.bisturi={
+ get meshes(){return meshes},get selected(){return selected},get tool(){return tool},get modelLoaded(){return modelLoaded},
+ select,setTool,fit,setView,status,
+ setTransformMode(mode){transform.setMode(mode);if(tool!=='Mover')setTool('Mover');else if(selected&&!explode&&!bedMode)attachGizmo(selected);},
+ get transformMode(){return transform.mode},
+ mergeVisiblePieces(){try{mergeVisiblePieces()}catch(e){status(e.message)}},
+ modelSize(){root.updateMatrixWorld(true);const b=new THREE.Box3().setFromObject(root);return b.isEmpty()?null:b.getSize(new THREE.Vector3());},
+ cameraQuaternion(){return camera.quaternion},
+ nozzle(){return $('nozzle').value}
+};
+window.dispatchEvent(new Event('bisturi-listo'));
 
 window.__bisturiListo=true;
